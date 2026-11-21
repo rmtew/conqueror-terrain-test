@@ -1,0 +1,71 @@
+name: Build
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Install MinGW GCC
+        id: msys2
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-make
+      - name: Install Python requirements
+        run: python -m pip install -r requirements.txt
+      - name: Build vasm on Linux
+        if: runner.os == 'Linux'
+        run: python bin/setup.py
+      - name: Build vasm on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          MSYS2_ROOT: ${{ steps.msys2.outputs.msys2-location }}
+        run: |
+          $env:PATH = "$(Join-Path $env:MSYS2_ROOT 'mingw64/bin');$env:PATH"
+          python bin/setup.py
+      - name: Build Linux
+        if: runner.os == 'Linux'
+        run: ./build.sh
+      - name: Build Windows
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: build.bat
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ runner.os }}
+          path: |
+            build/TankRenderLab
+            build/TankRenderLab.adf
+          if-no-files-found: error
+  compare:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Verify Linux and Windows Hunk files are identical
+        run: |
+          cmp artifacts/build-Linux/TankRenderLab artifacts/build-Windows/TankRenderLab
+          sha256sum artifacts/build-Linux/TankRenderLab
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TankRenderLab
+          path: |
+            artifacts/build-Linux/TankRenderLab
+            artifacts/build-Linux/TankRenderLab.adf
+          if-no-files-found: error
