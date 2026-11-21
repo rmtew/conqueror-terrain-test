@@ -1,12 +1,26 @@
-; Conqueror Terrain Test: the complete B86 Tank Render Lab benchmark suite.
-; The lab's authored route, models, panel art and lookup data are inline.
-; No Conqueror executable or assets are required.
-; Amiga CLI entry and return; PAL 68000/OCS, three 320x200 bitplanes.
+; Tank Render Lab: B86 benchmark suite
+; Amiga 500 target: PAL, 68000, OCS, and 512 KiB of Chip RAM.
+; Each display page has three 320 x 200 bitplanes.
+; Start the program from AmigaDOS. No Conqueror files are necessary.
+;
+; Source sections
+; - Playback: hardware ownership, stage control, input, and frame changes.
+; - Display data: Copper lists, screen buffers, and panel graphics.
+; - Scene: simulation, terrain, model geometry, and projection.
+; - Painter and rasterizer: depth order, clipping, edges, and spans.
+; - Inset map and FPS: map updates, measurement, and the results screen.
+;
+; A word has 16 bits. A longword has 32 bits.
+; Q4, Q6, and Q7 values have 4, 6, and 7 fractional bits.
+; A display page has all three bitplanes. The back page is not visible.
+; FPS means frames per second. DMA means direct memory access.
+; RLE means run-length encoding. ICR means interrupt control register.
+; Input and output notes name the registers and their operand sizes.
         include "include/amiga_hw.i"
         include "include/amiga_os.i"
 
-; Models use the rounded-Z reciprocal table. Exact fallback handles
-; values outside the table and clipped vertices on the near plane.
+; The model projector uses a reciprocal table indexed by rounded depth.
+; The projector uses exact division at the near plane or outside the table.
 MODEL_RECIPROCAL_MODE equ 2
 
 ; ------------------------------------------------------------------------
@@ -14,13 +28,13 @@ MODEL_RECIPROCAL_MODE equ 2
 ; ------------------------------------------------------------------------
 
         section code,code
+; The exported trace labels do not add code to the timed stages.
         xdef play_title_wait,play_frame_begin,play_update_end,play_clear_begin,play_clear_end
         xdef trial_prep_work_end,trial_clear_final_launch
         xdef play_clear_second_fence,play_clear_final_launch_end
         xdef play_prepare_end,play_draw_end,play_flip_end,play_scene,play_front,play_back,play_return,play_scene_end
         xdef play_arm_late
         xdef play_copper_front,play_copper_back,play_copper1_begin,play_copper1_end,play_copper2_begin,play_copper2_end,play_pages
-
 FPS_ROW equ 16
         xdef play_suite_stage,play_suite_done
         xdef play_suite_track,play_suite_hull
@@ -64,15 +78,16 @@ TP_C7_CODE equ $45
 ; Scene scratch record layout and capture ABI
 ; ------------------------------------------------------------------------
 
-; Scratch record offsets are pinned for scene captures.
-; Worst case: 156 ground + 2*40 tanks + 12*4 trees + 10 house
-; + 3*8 field structures + 8 ambient effect + 8 tracer = 334 vertices.
+; Keep these offsets constant for the scene capture tools.
+; The maximum scene has 334 vertices:
+; - 156 terrain vertices, 80 tank vertices, and 48 tree vertices.
+; - 10 house vertices, 24 structure vertices, and 16 effect vertices.
 SC_MAX_VERTICES equ 352
 SC_MAX_FACES equ 224
 SC_GROUND_MAX equ 21
 SC_GRID_WIDTH equ 12
 SC_GRID_DEPTH equ 16
-; Prop admission is the older lattice window, not the projected strip.
+; Use the lattice bounds to select props. Do not use the projected strip bounds.
 SC_PROP_X_INTERVALS equ 12
 SC_PROP_Z_INTERVALS equ 11
 SC_PROP_X_END equ 2*SC_PROP_X_INTERVALS
@@ -112,7 +127,8 @@ sc_face_count equ sc_vertex_count+2
 sc_terrain_faces equ sc_face_count+2
 sc_draw_count equ sc_terrain_faces+2
 sc_draw_order_from_temp equ sc_draw_count+2
-; Tree face bounds pack into two bytes next to the painter state.
+; Two bytes next to the painter state contain the limits of the tree face range.
+; The end index is exclusive.
     ifgt SC_MAX_FACES-255
     fail "Tree face bounds must fit one byte"
     endif
@@ -120,36 +136,40 @@ sc_tree_first_face equ sc_draw_order_from_temp
 sc_tree_end_face equ sc_draw_order_from_temp+1
 sc_draw_mode equ sc_draw_order_from_temp+2
 sc_terrain_end equ sc_draw_mode+4
-; Append simulation fields without moving captured terrain offsets.
-sc_turret_yaw   equ sc_terrain_end       ; 2 independent yaw bytes
-sc_tracer_x     equ sc_turret_yaw+2      ; Q7 world position
-sc_tracer_y     equ sc_tracer_x+2        ; integer world height
-sc_tracer_z     equ sc_tracer_y+2        ; Q7 world position
-sc_tracer_dx    equ sc_tracer_z+2        ; Q7 world units per tick
+; Put the simulation fields after the terrain fields to keep the capture offsets constant.
+sc_turret_yaw   equ sc_terrain_end  ; Two yaw bytes, one for each tank.
+sc_tracer_x     equ sc_turret_yaw+2  ; World X (Q7).
+sc_tracer_y     equ sc_tracer_x+2  ; World Y (integer).
+sc_tracer_z     equ sc_tracer_y+2  ; World Z (Q7).
+sc_tracer_dx    equ sc_tracer_z+2  ; X displacement per tick (Q7).
 sc_tracer_dz    equ sc_tracer_dx+2
-sc_tracer_life  equ sc_tracer_dz+2       ; zero: nothing to draw
+sc_tracer_life  equ sc_tracer_dz+2  ; Zero means no visible tracer.
 sc_tracer_tank  equ sc_tracer_life+2
-sc_tracer_yaw   equ sc_tracer_tank+2     ; yaw frozen at launch
+sc_tracer_yaw   equ sc_tracer_tank+2  ; Yaw at launch.
 sc_size         equ sc_tracer_yaw+2
 sc_turret_bytes equ sc_size-sc_turret_yaw
 PL_PLANES       equ 3
-PL_FRAME_BYTES  equ 24000
-PL_PLANE_BYTES  equ 8000
-PL_ROW_BYTES    equ 40
+PL_WIDTH        equ 320
+PL_HEIGHT       equ 200
+PL_ROW_BYTES    equ PL_WIDTH/8
+PL_PLANE_BYTES  equ PL_ROW_BYTES*PL_HEIGHT
+PL_FRAME_BYTES  equ PL_PLANES*PL_PLANE_BYTES
 PL_VIEW_TOP     equ 56
-PL_VIEW_ROWS    equ 144
+PL_VIEW_ROWS    equ PL_HEIGHT-PL_VIEW_TOP
+; BLTSIZE: the height uses bits 15 to 6. The width uses bits 5 to 0.
+PL_CLEAR_SIZE   equ PL_VIEW_ROWS*64+PL_ROW_BYTES/2
 PL_DMA_MASK     equ $07ff
 PL_IRQ_MASK     equ $7fff
 PL_SEED         equ $54424e43
 PL_TICKS        equ 4
 PL_DIW_STOP     equ $f4c1
 PL_ARM_BEGIN    equ (PL_DIW_STOP>>8)+1
-PL_ARM_PAL_END  equ 311-256       ; permit lines up to 310
-PL_ARM_NTSC_END equ 260-256       ; permit lines up to 259
-PL_PAL_DETECT   equ 272-256       ; short and long NTSC wrap earlier
+PL_ARM_PAL_END  equ 311-256  ; Last permitted line: 310.
+PL_ARM_NTSC_END equ 260-256  ; Last permitted line: 259.
+PL_PAL_DETECT   equ 272-256  ; NTSC fields end before line 272.
 
-        ; This gate relies on an OCS stop below v256, with the auto
-        ; vertical high bit clear, plus a full line after that stop.
+        ; The window must end before line 256. The OCS automatic high bit must be clear.
+        ; Leave one full line after the display window ends.
         iflt (PL_DIW_STOP>>8)-128
         fail "The Copper flip requires an OCS display stop below v256"
         endif
@@ -157,6 +177,7 @@ PL_PAL_DETECT   equ 272-256       ; short and long NTSC wrap earlier
         fail "The Copper flip post-display start must fit the low VPOS byte"
         endif
 
+; AmigaDOS entry. The program uses a private stack until it returns to AmigaDOS.
 play_entry:
         move.l  sp,play_host_stack
         lea     play_stack_end,sp
@@ -190,10 +211,10 @@ play_title_wait:
 
 play_frame_begin:
         movea.l play_back,a4
-        bsr.w   play_begin_clear  ; Overlap first plane with simulation.
+        bsr.w   play_begin_clear  ; Start the first clear before the simulation.
         lea     play_scene,a3
         move.l  a2,-(sp)
-        movea.l a3,a2            ; keep the scene bound across all four ticks
+        movea.l a3,a2  ; Keep the scene address for all four ticks.
         moveq   #PL_TICKS-1,d6
         tst.b   play_suite_stage
         beq.s   .step
@@ -217,7 +238,7 @@ play_clear_end:
         bsr.w   tb_scene_prepare_draw
         addq.l  #8,sp
 trial_prep_work_end:
-        bsr.w   play_wait_blit    ; Final plane must finish before the first draw.
+        bsr.w   play_wait_blit  ; Wait for the last clear before drawing.
 play_prepare_end:
         bsr.w   play_poll_input
         pea     (a4)
@@ -230,14 +251,14 @@ play_draw_end:
         move.l  play_copper_back,d0
         move.l  play_copper_front,play_copper_back
         move.l  d0,play_copper_front
-        move.l  d0,CUSTOM+COP1LCH ; Copper loads this at the next field reset.
+        move.l  d0,CUSTOM+COP1LCH  ; The Copper reads this address at the next field start.
         move.l  play_back,d0
         move.l  play_front,play_back
         move.l  d0,play_front
 play_flip_end:
         jsr     play_fps_measure
         bsr.w   play_poll_input
-        btst    #0,play_input_pending ; Escape takes priority over a held mouse.
+        btst    #0,play_input_pending  ; Escape has priority over the mouse button.
         bne.s   play_exit
         btst    #1,play_input_pending
         beq.w   play_suite_next
@@ -287,8 +308,8 @@ play_suite_next:
         cmpi.l  #PL_SUITE_CHASE_TICKS,play_scene+sc_tick
         blo.w   play_frame_begin
         move.b  #1,play_suite_stage
-        ; Match a clean launched event capture, including unused vertex
-        ; slots. No back-page drawing or blit is pending during this reset.
+        ; Clear the complete scene record, including unused vertex slots.
+        ; No drawing or blitter operation uses the back page during this reset.
         lea     play_scene,a0
         move.w  #(play_scene_end-play_scene)/2-1,d0
 .clear:
@@ -314,11 +335,11 @@ play_suite_results_hold:
 play_suite_new_header:
         jsr     play_fps_stage_begin
         move.w  #2,play_headers_left
-        ; Full panel replacement also invalidates both minimap headers.
+        ; The header copy replaces the map area. Reset the map state for both pages.
         jmp     tb_map_init
 
-; Nonblocking keyboard read. Reading an Amiga keyboard byte requires
-; an SP acknowledgement; wait across two full scanlines in that case only.
+; Return a keyboard byte without waiting for input.
+; If a byte is available, hold the serial-port acknowledge signal for two complete scan lines.
 play_read_key:
         moveq   #-1,d0
         btst    #CIAAB_SP,CIAA_ICR
@@ -328,7 +349,7 @@ play_decode_key:
         move.b  CIAA_SDR,d0
         not.b   d0
         ror.b   #1,d0
-        move.b  CIAA_CRA,d3         ; keep the caller's serial direction
+        move.b  CIAA_CRA,d3  ; Save the serial-port direction.
         bset    #CIAAB_SPMODE,CIAA_CRA
         move.b  CUSTOM+VHPOSR,d1
         moveq   #2,d2
@@ -343,14 +364,14 @@ play_decode_key:
 .done:
         rts
 
-; Observe short mouse clicks and acknowledge keyboard bytes within the
-; software frame. Defer exit until drawing and the blit have completed.
+; Record short mouse clicks and acknowledge keyboard bytes during a frame.
+; The main loop processes an exit request after drawing and the last blitter operation.
 play_poll_input:
         btst    #CIAAB_FIRE0,CIAA_PRA
         bne.s   .keyboard
         bset    #1,play_input_pending
 .keyboard:
-        ; Reading ICR acknowledges SP: sample it exactly once.
+        ; A read of ICR acknowledges the serial port. Read ICR only once.
         btst    #CIAAB_SP,CIAA_ICR
         beq.s   .no_key
         movem.l d0-d3,-(sp)
@@ -364,11 +385,9 @@ play_poll_input:
         rts
 
 play_vblank:
-        ; No visible fetches after DIW stop. Accept either side of line
-        ; 256, but reserve a whole line before the earliest field wrap.
-        ; At v255 -> v256 a duplicated low sample either accepts inside
-        ; the blank or retries. The high path must not accept the low
-        ; byte after field wrap, since the old page is still visible.
+        ; Wait until the display window ends. Leave one full line before the field ends.
+        ; At line 256, a repeated low byte can select blanking or cause a retry.
+        ; In the high-byte path, check bit 8 again to reject the start of a new field.
         move.b  play_arm_late,d0
 .beam:
         btst    #VPOSB_V8_LO,CUSTOM+VPOSR+1
@@ -379,12 +398,12 @@ play_vblank:
 .high:
         cmp.b   CUSTOM+VHPOSR,d0
         bls.s   .beam
-        btst    #VPOSB_V8_LO,CUSTOM+VPOSR+1   ; reject a rollover during the read
+        btst    #VPOSB_V8_LO,CUSTOM+VPOSR+1  ; Reject a field wrap during the read.
         beq.s   .beam
         rts
 
-; Initial game chrome is copied to each page at its first use as back.
-; All later changes in the header are confined to the dynamic map.
+; Copy the fixed header to a back page on its first use in each stage.
+; The map and live FPS routines update their own areas separately.
 play_copy_header:
         lea     play_header,a0
         movea.l a4,a1
@@ -398,8 +417,7 @@ play_copy_header:
         dbra    d0,.copy
         lea     PL_PLANE_BYTES-PL_VIEW_TOP*PL_ROW_BYTES(a1),a1
         dbra    d1,.plane
-        ; Stamp the purpose on each back page during its header refresh.
-        ; No text rendering or header writes on steady-state frames.
+        ; Copy the stage title with the fixed header. Do not copy it on each frame.
         moveq   #0,d0
         move.b  play_suite_stage,d0
         lsl.w   #8,d0
@@ -424,25 +442,25 @@ play_copy_header:
         move.l  (sp)+,d2
         rts
 
-; Clear only the view of the back buffer, leaving the live map/header
-; intact. Start planes 0, 1, and 2 before simulation, scene construction,
-; and scene transform respectively. Fence before retargeting or drawing.
+; Clear only the viewport of the back page. Keep the map and header.
+; Start each plane clear before its CPU phase: simulation, scene construction, or projection.
+; Wait for the active clear before changing the blitter destination or drawing.
 play_begin_clear:
         move.l  #$01000000,CUSTOM+BLTCON0
         move.l  #$ffffffff,CUSTOM+BLTAFWM
         clr.w   CUSTOM+BLTDMOD
         lea     PL_VIEW_TOP*PL_ROW_BYTES(a4),a0
         move.l  a0,CUSTOM+BLTDPTH
-        move.w  #PL_VIEW_ROWS*64+20,CUSTOM+BLTSIZE
+        move.w  #PL_CLEAR_SIZE,CUSTOM+BLTSIZE
         rts
 play_clear:
-        bsr.s   play_wait_blit    ; The first plane can still be in flight.
+        bsr.s   play_wait_blit  ; Wait for the first plane clear.
         lea     PL_PLANE_BYTES+PL_VIEW_TOP*PL_ROW_BYTES(a4),a0
         move.l  a0,CUSTOM+BLTDPTH
-        move.w  #PL_VIEW_ROWS*64+20,CUSTOM+BLTSIZE
+        move.w  #PL_CLEAR_SIZE,CUSTOM+BLTSIZE
         rts
 
-; Called from preparation after sc_make_scene. Clobbers only scratch A0.
+; Start the last plane clear after scene construction. Only A0 changes.
 play_clear_final:
 play_clear_second_fence:
         bsr.s   play_wait_blit
@@ -450,10 +468,11 @@ play_clear_second_fence:
         lea     2*PL_PLANE_BYTES+PL_VIEW_TOP*PL_ROW_BYTES(a0),a0
         move.l  a0,CUSTOM+BLTDPTH
 trial_clear_final_launch:
-        move.w  #PL_VIEW_ROWS*64+20,CUSTOM+BLTSIZE
+        move.w  #PL_CLEAR_SIZE,CUSTOM+BLTSIZE
 play_clear_final_launch_end:
         rts
 play_wait_blit:
+        ; Read DMACONR before the busy-bit test for early Agnus revisions.
         tst.w   CUSTOM+DMACONR
 .wait:
         btst    #DMAB_BBUSY_HI,CUSTOM+DMACONR
@@ -472,8 +491,8 @@ play_display:
 .open:
         movea.l d0,a6
         move.l  GB_ACTIVIEW(a6),play_view
-        jsr     _LVOOwnBlitter(a6)          ; Keep other tasks off the blitter until display is restored
-        jsr     _LVOWaitBlit(a6)          ; WaitBlit before interrupt masking
+        jsr     _LVOOwnBlitter(a6)  ; Prevent other tasks from using the blitter.
+        jsr     _LVOWaitBlit(a6)  ; Wait before disabling interrupts.
         suba.l  a1,a1
         jsr     _LVOLoadView(a6)
         jsr     _LVOWaitTOF(a6)
@@ -495,9 +514,9 @@ play_display:
         move.l  #play_copper2,play_copper_back
         clr.w   CUSTOM+COPCON
         move.l  #play_copper,CUSTOM+COP1LCH
-        move.w  #DMAF_SETCLR|DMAF_DMAEN|DMAF_BPLEN|DMAF_COPEN|DMAF_BLTEN,CUSTOM+DMACON  ; master, Copper, bitplanes, blitter idle or active
-        ; Fixed phase before the visible fetch window. Default to the
-        ; shorter field; only widen if V8 is still set well past NTSC wrap.
+        move.w  #DMAF_SETCLR|DMAF_DMAEN|DMAF_BPLEN|DMAF_COPEN|DMAF_BLTEN,CUSTOM+DMACON
+        ; Use the short field limit until the beam passes the NTSC limit.
+        ; If bit 8 stays set after that limit, use the PAL field limit.
         move.b  #PL_ARM_NTSC_END,play_arm_late
 .high:
         btst    #VPOSB_V8_LO,CUSTOM+VPOSR+1
@@ -531,8 +550,8 @@ play_display:
 
 play_restore:
         move.w  #PL_DMA_MASK,CUSTOM+DMACON
-        ; OwnBlitter and the final fence guarantee no blit is in flight.
-        ; Do not hand back an IRQ request we created, or clear a preexisting one.
+        ; The program has exclusive use of the blitter. No blitter operation is active.
+        ; Clear the blitter interrupt request only if it was clear on entry.
         btst    #INTB_BLIT,play_pending_irq+1
         bne.s   .keep_blit_request
         move.w  #INTF_BLIT,CUSTOM+INTREQ
@@ -554,16 +573,17 @@ play_restore:
         jsr     _LVOLoadView(a6)
         jsr     _LVOWaitTOF(a6)
         jsr     _LVOWaitTOF(a6)
-        jsr     _LVODisownBlitter(a6)          ; release graphics ownership
+        jsr     _LVODisownBlitter(a6)
         movea.l play_gfx,a1
         movea.l SYSBASE_ADDR.w,a6
         jmp     _LVOCloseLibrary(a6)
 
-; Decode the embedded 3-plane art directly into its existing page.
-; A1 = word stream, A0 = 24000-byte destination. Both buffers aligned.
-; Positive count: copy that many literals. Negative: repeat next word
-; that many times. Zero ends the stream. Clobbers D0/D1/A0/A1 only.
-; Only called before Chase or after Scenery Out, never within timed work.
+; Decode a panel directly into a display page.
+; Inputs: A1 = word stream, A0 = destination (24,000 bytes). Both addresses are even.
+; A positive count gives the number of literal words that follow.
+; A negative count gives the negative of the repeat count for the next word.
+; A zero count ends the stream. Only D0, D1, A0, and A1 change.
+; The title and results screens use this routine outside the timed stages.
 play_unpack_panel:
 .packet:
         move.w  (a1)+,d0
@@ -627,7 +647,7 @@ play_host_stack:    ds.l 1
 play_headers_left:  ds.w 1
 play_input_pending: ds.b 1
 play_arm_late:      ds.b 1
-        ; Capture ABI tag, no guest storage. Pinned offsets for xyz-v1 export.
+        ; The xyz-v1 capture tag has no storage. Keep the following offsets constant.
         ifne (SC_GRID_WIDTH-12)|(SC_GRID_DEPTH-16)|(sc_camx-2588)|(sc_grid_x-2604)|(sc_grid_z-2628)
         fail "Recheck typed strip capture axis layout"
         endif
@@ -638,7 +658,7 @@ play_arm_late:      ds.b 1
 play_scene_typed_strip_v1:
 play_scene:         ds.b sc_size+2*(SC_GRID_WIDTH-1)*(SC_GRID_DEPTH-1)+12
 play_scene_end:
-play_stack:         ds.b 4096
+play_stack:         ds.b 4096  ; Private stack, immediately after the scene.
 play_stack_end:
 play_suite_track:   ds.w 4
 play_suite_hull:    ds.b 2
@@ -658,7 +678,7 @@ play_pages: ds.b 2*PL_FRAME_BYTES
 
         section panels,data
 
-; Lab title screen, three 8000-byte planes, word-RLE.
+; Title screen: three bitplanes, 8,000 bytes each, encoded with word RLE.
 play_title_rle:
         dc.w $fd7f,$0000
         dc.w $0001,$00ff
@@ -855,7 +875,7 @@ play_title_rle:
         dc.w $fd7b,$0000
         dc.w $0000
 
-; Tank Render Lab stage and FPS panel.
+; Fixed header for the four stages. The map and live FPS have separate fields.
 play_header:
         ; Plane 0, palette index bit 0; bit 15 is the leftmost pixel.
         dcb.w 20,0
@@ -1029,7 +1049,7 @@ play_header:
         dcb.w 20,0
         dcb.w 20,0
 
-; Lab results screen background, three 8000-byte planes, word-RLE.
+; Results background: three bitplanes, 8,000 bytes each, encoded with word RLE.
 play_fps_results_rle:
         dc.w $fdce,$0000
         dc.w $0001,$0fff
@@ -1577,45 +1597,39 @@ play_suite_labels:
         section code,code
 
 ; ------------------------------------------------------------------------
-; Simulation, model geometry, projection and painter submission
+; Scene simulation, geometry, and projection
 ; ------------------------------------------------------------------------
 
-; Scene module. Public calls observe the common stack ABI; private routines
-; explicitly describe their register contracts. A2 is private scene context.
-
-; ------------------------------------------------------------------------
-; Scene scratch record layout and capture ABI
-; ------------------------------------------------------------------------
-
-; Scratch record offsets are pinned for scene captures.
+; Private scene routines use A2 as the scene record address.
+; tb_scene_init and tb_scene_prepare_draw take their arguments on the stack.
 
     xdef tb_scene_init,tb_scene_step
 SC_TERRAIN_ROW_END_BYTES equ 4*(SC_GRID_DEPTH-1)
 
-SC_NEAR     equ 512             ; Q4    32 world units
-SC_FOCUS_Q4 equ 4096            ; 256px focal length
-SC_CAMERA_ORIGIN_Y equ 1216     ; Q4, row 20 within the viewport (page 76)
+SC_NEAR     equ 512                   ; The near plane is 32 world units away (Q4).
+SC_FOCUS_Q4 equ 4096                  ; The focal length is 256 pixels.
+SC_CAMERA_ORIGIN_Y equ 1216           ; The origin is page row 76, or viewport row 20 (Q4).
 SC_EYE_HEIGHT equ 44
 SC_EYE_DX equ 0
 SC_EYE_DZ equ -200
 SC_EYE_YAW equ 128
-SC_CX       equ 2560            ; Q4   160 pixels
+SC_CX       equ 2560                  ; The origin is pixel 160 (Q4).
     ifne (SC_GRID_WIDTH&3)|(SC_FOCUS_Q4-4096)
     fail "Recheck strip byte row alignment and exact X scaling"
     endif
-; Use the retired terrain section of the old mixed XYZ array, so actor
-; record offsets and the public scene allocation are unchanged.
+; Store terrain heights in the reserved prefix of the world vertex array.
 sc_strip_heights equ sc_world_vertices
-; Private cell row counts between sc_terrain and terrain order admission.
-; Typed terrain uses only the first SC_GRID_POINTS bytes of its old XYZ
-; slots; the canonical capture reconstructs the full typed world array.
+; Store the cell counts after the height bytes and before the model vertices.
+; The capture tool reconstructs terrain vertices from the two axes and the height
+; bytes.
 sc_strip_row_counts equ sc_strip_heights+SC_GRID_POINTS
     ifgt SC_GRID_DEPTH-1-5*SC_GRID_POINTS
     fail "Terrain row counts overlap actor world vertices"
     endif
 
-; Fixed-phase tank coordinates: Q7 sine is in -128..128. The two
-; compile-time radii keep the signed product in the low word.
+; Multiply a Q7 sine in [-128, 128] by a fixed radius. The product fits in a signed
+; word.
+; Add 127 to a negative product before the shift to round toward zero.
 SC_TANK_SCALE macro
     ifeq \1-35
     move.w  d0,d1
@@ -1632,7 +1646,7 @@ SC_TANK_SCALE macro
     asr.w   #7,d0
     endm
 
-; 48 = 3*16. The callers need a word, or sign-extend a bounded Q7 result.
+; Calculate 48 times the first argument as 3 times 16. The result occupies a word.
 SC_TIMES48_W macro
     lsl.w   #4,\1
     move.w  \1,\2
@@ -1640,6 +1654,10 @@ SC_TIMES48_W macro
     add.w   \2,\1
     endm
 
+; Read the Q7 sine table at A0. D2.W contains the phase, and the argument supplies the
+; radius.
+; Write the X, Y, and Z words at A1. Write zero for Y until the ground height is
+; known.
 SC_TANK_POSITION macro
     add.w   d2,d2
     move.w  (a0,d2.w),d0
@@ -1654,15 +1672,16 @@ SC_TANK_POSITION macro
     rts
     endm
 
-; Index products used as ADDA.W/.W displacement, leaving high bits dead.
+; Multiply the first argument by three. A word displacement does not use its upper 16
+; bits.
 SC_TIMES3_W macro
     move.w  \1,\2
     add.w   \1,\1
     add.w   \2,\1
     endm
 
-; D0.l / 8 with the same signed truncation as the reference axis cache.
-; The preceding addition supplies the sign condition code.
+; Initialize the scene record, the projection tables, and the first tank positions.
+; At entry, 4(SP) holds the scene address and 8(SP) holds the longword seed.
 tb_scene_init:
     movem.l d2-d3/a2-a3,-(sp)
     movea.l 20(sp),a2
@@ -1673,8 +1692,7 @@ tb_scene_init:
 .seeded:
     clr.l   sc_tick(a2)
     move.b  d0,sc_phase(a2)
-    ; Both whole hulls must fit the rendered footprint on the chase.
-    ; The offset keeps both hulls on supported ground during Chase.
+    ; This phase offset keeps both hulls on the terrain during Chase.
     addi.b  #40,d0
     move.b  d0,sc_phase+1(a2)
 
@@ -1695,7 +1713,7 @@ tb_scene_init:
     move.w  d1,d0
     lsr.w   #1,d0
     andi.l  #$ffff,d0
-    addi.l  #SC_FOCUS_Q4*256,d0          ; Focal length * 4096, before rounding by i/2.
+    addi.l  #SC_FOCUS_Q4*256,d0       ; Add half the depth for nearest rounding.
     divu.w  d1,d0
     move.w  d0,(a0)+
     addq.w  #1,d1
@@ -1712,7 +1730,7 @@ tb_scene_init:
     movem.l (sp)+,d2-d3/a2-a3
     rts
 
-; A2 is the active scene. Update one tick, including all aim and tracer work.
+; Advance one simulation tick. A2 contains the scene address.
 tb_scene_step:
     addq.l  #1,sc_tick(a2)
     addq.b  #1,sc_phase(a2)
@@ -1726,9 +1744,10 @@ tb_scene_step:
     bhs.s   .updated
     addq.b  #1,sc_phase+1(a2)
 .updated:
-    ; Fall through so the update returns straight to the caller.
+    ; Continue directly to sc_update_tanks. Its RTS returns to the caller of
+    ; tb_scene_step.
 
-; Construct the two integral positions from the seeded phase bytes.
+; Use circular motion during Chase. The later stages use scripted forward motion.
 sc_update_tanks:
     movem.l d2-d3,-(sp)
     tst.b   play_suite_stage
@@ -1757,10 +1776,8 @@ sc_update_tanks:
 ; Stage-specific hull motion
 ; ------------------------------------------------------------------------
 
-; In the drive stages, each hull's forward vector drives its position.
-; A yaw of 64 points to +X (increasing world X). The optional chase still
-; uses its original circular movement and analytical tangent. Turrets
-; keep their own native tracking and never steer the hull.
+; In the drive stages, each hull moves in its own forward direction.
+; A yaw of 64 points along positive X. Turret aim does not change the hull direction.
 sc_suite_drive:
     move.l  a4,-(sp)
     tst.l   sc_tick(a2)
@@ -1789,20 +1806,20 @@ sc_suite_drive:
     addq.l  #2,a0
     bra.s   .turn_at
 .speed:
-    moveq   #8,d1               ; settle at 2 world units/tick (Q2)
+    moveq   #8,d1                     ; Use the 2-unit cruise speed (Q2).
     cmpi.w  #16,d3
     bhs.s   .lead
     moveq   #12,d1
     cmpi.w  #12,d3
     bls.s   .opening
     subi.w  #12,d3
-    sub.w   d3,d1              ; ease from 3 to 2 over four ticks
+    sub.w   d3,d1                     ; Decrease from 3 to 2 units per tick.
     bra.s   .lead
 .opening:
     cmpi.w  #6,d3
     bhs.s   .lead
     move.w  d3,d1
-    add.w   d1,d1              ; accelerate by half a world unit/tick
+    add.w   d1,d1                     ; Increase speed by half a unit per tick.
 .lead:
     lea     sc_sin_q7(a2),a4
     lea     play_suite_track,a0
@@ -1813,12 +1830,12 @@ sc_suite_drive:
     move.w  sc_tick+2(a2),d1
     subi.w  #22,d1
     bgt.s   .other_roll
-    moveq   #0,d1              ; far tank holds before joining the drive
+    moveq   #0,d1                     ; Hold the second tank before its start tick.
     bra.s   .other
 .other_roll:
     cmpi.w  #8,d1
     bls.s   .other
-    moveq   #8,d1              ; ease up by a quarter unit/tick, then cruise
+    moveq   #8,d1                     ; Limit the second tank to its cruise speed.
 .other:
     moveq   #0,d0
     move.b  play_suite_hull+1,d0
@@ -1829,10 +1846,11 @@ sc_suite_drive:
 .steering:
     dc.w    33,40,-1,49,56,1,89,96,1,105,112,-1,0
 
-; D0.w native yaw, D1.w speed (Q2 game units/tick).
-; A0 -> two signed Q7 movement words, A1 -> original integer XYZ.
-; Produce both X and Z from that same heading, with no lateral component.
-; Publish floor-quantized integer world coordinates for existing consumers.
+; D0.W contains yaw. D1.W contains speed in Q2 world units per tick.
+; A0 points to two signed Q7 position words. A1 points to three integral position
+; words.
+; Use the same heading for X and Z. Round the integral X and Z toward negative
+; infinity.
 sc_suite_step_hull:
     add.w   d0,d0
     move.w  (a4,d0.w),d2
@@ -1854,8 +1872,8 @@ sc_suite_step_hull:
     move.w  d2,(a1)+
     rts
 
-; Use a level, fixed-yaw camera following the lead tank. Fixed yaw lets
-; axis-aligned terrain rows share projection terms.
+; Keep the camera level and follow the lead tank. Fixed yaw lets an entire terrain row
+; share its depth.
 sc_camera:
     move.b  #SC_EYE_YAW,sc_camera_yaw(a2)
     move.w  #SC_CX,sc_screen_x(a2)
@@ -1873,8 +1891,11 @@ sc_camera:
     add.w   d1,sc_camy(a2)
     rts
 
-; D0/D1/D2 signed Q4 camera coordinates, D3 mode -> D0/D1 long screen
-; coordinates. Requires Z >= 32 world units. Preserves D2-D7/A2-A6.
+; D0.W, D1.W, and D2.W contain signed Q4 camera X, Y, and Z. Z is at least 32 world
+; units.
+; D3.W selects the method. Value 2 uses the reciprocal table when the rounded depth is
+; in range.
+; Return Q4 screen X and Y in D0.L and D1.L. Preserve D2-D7 and A2-A6.
 sc_project:
     movem.l d4-d6,-(sp)
     cmpi.w  #2,d3
@@ -1904,8 +1925,8 @@ sc_project:
     asr.l   #4,d1
     bra.w   .centre
 .slot32:
-    ; The first admitted reciprocal is +32768, not signed -32768.
-    ; Keep rounded-depth semantics: (signed Q4 * 32768) / 4096.
+    ; The table entry for depth 32 is +32768, which does not fit in a signed word.
+    ; Shift left by three to calculate (Q4 coordinate * 32768) / 4096.
     ext.l   d0
     ext.l   d1
     lsl.l   #3,d0
@@ -1918,7 +1939,6 @@ sc_project:
     divs.w  d2,d1
     ext.l   d0
     ext.l   d1
-    bra.w   .centre
 .centre:
     move.w  sc_screen_x(a2),d4
     ext.l   d4
@@ -1931,9 +1951,10 @@ sc_project:
     rts
 
 ; ------------------------------------------------------------------------
-; Fixed-point camera and trigonometry table constants
+; Q7 sine table
 ; ------------------------------------------------------------------------
 
+; The table has 256 samples per turn. The scale is 128, so +1.0 is 128.
 sc_sine_table:
     dc.w 0,3,6,9,13,16,19,22,25,28,31,34
     dc.w 37,40,43,46,49,52,55,58,60,63,66,68
@@ -1958,9 +1979,11 @@ sc_sine_table:
     dc.w -49,-46,-43,-40,-37,-34,-31,-28,-25,-22,-19,-16
     dc.w -13,-9,-6,-3
 
-; Mutable arrays use a 16-bit index in bounds, expanded to a byte offset.
-; D0-D3.w vertices, D4.w color (bit 8 denotes a triangle);
-; A2 scene; preserves D0-D7/A3-A6 and clobbers A0/A1 only.
+; Append a model face. A2 contains the scene address, and D0.W-D3.W contain vertex
+; indices.
+; D4.W contains a material index. Bit 8 sets a triangle, with a duplicate fourth
+; index.
+; Preserve D0-D7 and A2-A6. A0 and A1 are scratch registers.
 sc_face:
     move.l  d5,-(sp)
     moveq   #0,d5
@@ -1983,7 +2006,7 @@ sc_face:
     moveq   #3,d5
 .count:
     move.b  d5,(a0)+
-    ; Terrain has its own material table and bypasses this model path.
+    ; Resolve the model material here. Terrain uses a separate table.
     moveq   #0,d5
     move.b  d4,d5
     lea     sc_model_inks(pc),a1
@@ -1996,10 +2019,11 @@ sc_face:
     move.l  (sp)+,d5
     rts
 
-; Eight-colour scene model shades in original author's material order.
+; Map model material indices to one of eight palette entries or to a checker pattern.
 sc_model_inks:
     dc.b    0,4,5,2,2,3,6,3,2,3,6,4,5,1,7,7
-    ; Track ends and tops: blue-black/brown. Sides: dark green/brown.
+    ; Use blue-black and brown for track ends and tops. Use dark green and brown for
+    ; track sides.
     dc.b    $40,$42
     even
 
@@ -2007,8 +2031,8 @@ sc_model_inks:
 ; Terrain window, height interpolation and material preparation
 ; ------------------------------------------------------------------------
 
-; Landscape-75 clips a 128-unit square from the 16-unit world lattice on
-; every frame. Each axis includes its two exact window bounds.
+; The map samples a height at each node and assigns one material to each cell.
+; The world lattice has 16 units between nodes.
 SC_MAP_SHIFT equ 5
 SC_MAP_CELLS equ 1<<SC_MAP_SHIFT
 SC_MAP_SIDE equ SC_MAP_CELLS+1
@@ -2020,12 +2044,10 @@ SC_TILE_MASK equ SC_TILE_SIZE-1
     fail "Precomputed strip need masks require an even 12-byte row"
     endif
 
-; D0.w center, A0 storage (10 words). If the square starts exactly on a
-; lattice line, the final two coordinates coincide and that cell is omitted.
-; D0.w tank coordinate, D1.w node count minus one, A0 output. Snap the
-; window to lattice nodes, retaining all cells as the lead tank moves.
-; Clamp the complete window to the authored map instead of inventing
-; additional flat cells outside it.
+; D0.W contains the tank coordinate, D1.W contains the node count minus one, and A0
+; points to the destination.
+; Snap the window to the lattice. Clamp the complete window to the map so it retains
+; all requested cells.
 sc_land_axis:
     andi.w  #-SC_TILE_SIZE,d0
     move.w  d1,d2
@@ -2049,7 +2071,7 @@ sc_land_axis:
     dbra    d1,.node
     rts
 
-; Map a signed coordinate to a safe cell and a [0,16] fraction.
+; Convert a signed coordinate to a clamped cell index and a fraction in [0, 16].
 SC_GROUND_CELL macro
     move.w  \1,\2
     cmpi.w  #SC_MAP_EDGE,\2
@@ -2068,17 +2090,18 @@ SC_GROUND_CELL macro
 .end\@:
     endm
 
-; D0.w world X, D2.w world Z -> D1.w height, positive up. Preserves
-; every other register. Nearest integer bilinear interpolation on [0,16]^2;
-; lattice nodes are a single byte lookup. Coordinates outside the authored
-; map extend its edge rather than wrapping into an unrelated hill.
+; D0.W and D2.W contain world X and Z. Return the height in D1.W. Preserve all other
+; registers.
+; Use one height byte at a lattice node. Otherwise, use bilinear interpolation and
+; round to the nearest integer.
+; Clamp coordinates outside the map to the nearest edge.
 sc_ground_height:
     movem.l d3-d6/a0,-(sp)
     SC_GROUND_CELL d0,d3,d4
     SC_GROUND_CELL d2,d5,d6
     move.w  d5,d1
     lsl.w   #SC_MAP_SHIFT,d1
-    add.w   d1,d5              ; node stride is one more than cell stride
+    add.w   d1,d5                     ; Include the last node in the row stride.
     add.w   d3,d5
     lea     sc_heightmap,a0
     adda.w  d5,a0
@@ -2088,7 +2111,7 @@ sc_ground_height:
     bne.s   .with_x
     tst.w   d6
     beq.s   .done
-    ; For lattice X the paired X interpolations collapse to one Z lerp.
+    ; When X is a lattice node, interpolate only along Z.
     moveq   #0,d5
     move.b  SC_MAP_SIDE(a0),d5
     sub.w   d1,d5
@@ -2098,7 +2121,7 @@ sc_ground_height:
     bra.s   .x_only
 .with_x:
 
-    ; Start with the two edge heights scaled by 16, then interpolate Z.
+    ; Interpolate each side in X at scale 16 before the Z step.
     moveq   #0,d3
     move.b  1(a0),d3
     sub.w   d1,d3
@@ -2117,7 +2140,7 @@ sc_ground_height:
     add.w   d3,d5
     sub.w   d1,d5
     muls.w  d6,d5
-    ; The authored 0..21 heights give a 0..5376 weighted sum.
+    ; The height range is [0, 21]. The weighted sum stays in [0, 5376].
     lsl.w   #4,d1
     add.w   d5,d1
     addi.w  #128,d1
@@ -2134,8 +2157,8 @@ SC_CLASS_TERRAIN_FACES equ (SC_GRID_WIDTH-1)*(SC_GRID_DEPTH-1)
 sc_strip equ sc_size
 sc_strip_fallback equ sc_strip+2*SC_CLASS_TERRAIN_FACES
 
-; Clip the original lattice against a literal camera-relative rectangle
-; before camera transformation. The aligned camera faces map -Z.
+; Clip the terrain lattice in world space before projection. The camera faces negative
+; Z.
 SC_FOOT_WEST equ 56
 SC_FOOT_EAST equ 100
 SC_FOOT_NEAR equ 96
@@ -2143,9 +2166,10 @@ SC_FOOT_CENTRE equ 124
 SC_FOOT_FAR  equ 304
 sc_front_dx equ sc_axis_x+32
 
-; D0/D2 low/high, D1 slot count minus one, A0 grid axis.
-; Emit the clipped endpoints and each original lattice line between.
-; Pad on the high side so unchanged face IDs still identify painter rows.
+; D0.W and D2.W contain the bounds. D1.W contains the slot count minus one. A0 points
+; to the destination.
+; Write both clipped bounds and all lattice nodes between them.
+; Repeat the high endpoint to keep the face IDs fixed.
 sc_foot_axis:
     cmpi.w  #-SC_MAP_EDGE,d0
     bge.s   .low
@@ -2170,7 +2194,8 @@ sc_foot_axis:
     dbra    d1,.last
     rts
 
-    ; D4 packed X interpolation descriptor, A6 source row -> D1 height.
+    ; D4.W contains the packed X descriptor. A6 points to the height row. Return the
+    ; height in D1.W.
     macro SC_LATTICE_HEIGHT_EDGE
     move.w  d4,d3
     lsr.w   #8,d3
@@ -2188,8 +2213,8 @@ sc_foot_axis:
     lsr.w   #4,d1
     endm
 
-; D2 is the number of admitted cells incident to a lattice row.
-; Write its complete 12-byte vertex mask, including a zero suffix.
+; D2.W contains the largest admitted cell count for either side of the row.
+; Copy its complete 12-byte vertex mask, including the zero suffix.
     macro SC_WRITE_PREFIX_NEEDED
     move.w  d2,d3
     add.w   d2,d2
@@ -2201,12 +2226,14 @@ sc_foot_axis:
     endr
     endm
 
+; Build the terrain strip and the terrain face records. A2 contains the scene address.
+; Keep the prop window separate from the camera footprint.
 sc_terrain:
     movem.l d2-d7/a3-a6,-(sp)
     move.w  #SC_GRID_POINTS,sc_vertex_count(a2)
     move.w  #SC_CLASS_TERRAIN_FACES,sc_face_count(a2)
-    ; Admit props against the route window, not a projected screen clip. These
-    ; axis scratch words are not used by the aligned camera transform.
+    ; Use the route window for prop admission. The camera projection does not use
+    ; these axes.
     move.w  sc_tank(a2),d0
     lea     sc_axis_x(a2),a0
     moveq   #SC_PROP_X_INTERVALS,d1
@@ -2217,7 +2244,6 @@ sc_terrain:
     bsr     sc_land_axis
 
     move.w  sc_camx(a2),d0
-    move.w  d0,d2
     andi.w  #-2,d0
     move.w  d0,d2
     subi.w  #SC_FOOT_WEST,d0
@@ -2239,9 +2265,9 @@ sc_terrain:
     moveq   #SC_GRID_DEPTH-1,d1
     bsr     sc_foot_axis
 
-    ; Height sampling on a rectangular grid is separable: classify each
-    ; world X once, then reuse its clamped column and fraction across Z.
-    ; Packed column index and row stride require this lattice format.
+    ; Classify each X coordinate once. Reuse its height column and fraction for every
+    ; Z row.
+    ; The packed descriptor uses the lattice dimensions checked below.
     ifne (SC_MAP_SIDE-17)*(SC_MAP_SIDE-33)|(SC_TILE_SHIFT-4)
     fail "Packed terrain heights support 17 or 33 nodes and 16-unit tiles"
     endif
@@ -2254,12 +2280,12 @@ sc_terrain:
     SC_GROUND_CELL d0,d4,d1
     cmpi.w  #SC_TILE_SIZE,d1
     bne.s   .save_height_col
-    addq.w  #1,d4              ; canonical exact edge node
+    addq.w  #1,d4                     ; Use the exact high-edge node.
     moveq   #0,d1
 .save_height_col:
     tst.w   d1
     beq.s   .height_index
-    ; Fractional endpoint: sign tags the column; fx occupies bits 8..11.
+    ; The sign bit marks a fractional endpoint. Bits 8 through 11 hold the X fraction.
     lsl.w   #8,d1
     or.w    d1,d4
     bset    #15,d4
@@ -2269,9 +2295,9 @@ sc_terrain:
     ifne SC_GRID_WIDTH-12
     fail "Recheck contiguous central height slice after grid width changes"
     endif
-    ; sc_foot_axis only inserts ascending consecutive lattice nodes,
-    ; with possible partial endpoints and repeated right-edge padding.
-    ; Hence untagged columns 1 and 8 seven nodes apart certify all eight.
+    ; Only the endpoints can be fractional, and padding repeats the high endpoint.
+    ; If columns 1 and 8 are lattice nodes seven steps apart, all eight interior
+    ; entries are consecutive.
     movea.w #-1,a4
     move.w  2(sp),d0
     bmi.s   .lattice_core_ready
@@ -2285,17 +2311,18 @@ sc_terrain:
     lea     sc_grid_z(a2),a3
     lea     sc_strip_heights(a2),a5
     moveq   #SC_GRID_DEPTH-1,d7
-    move.w  #32767,d2          ; first row always builds normally
+    move.w  #32767,d2                 ; Set a sentinel that cannot match the first row.
 .vertex_row:
     cmp.w   (a3),d2
     beq.w   .duplicate_row
     move.w  (a3)+,d2
-    ; A row shares its clamped Z cell and fraction. With aligned X,
-    ; interpolate once between matching columns of its two height rows.
+    ; All columns in a row share the Z cell and fraction.
+    ; At an exact X node, interpolate between the two source rows without
+    ; interpolating in X.
     SC_GROUND_CELL d2,d3,d5
     cmpi.w  #SC_TILE_SIZE,d5
     bne.s   .height_row
-    ; The high edge is already a node; no neighbour above row 16.
+    ; Use the last height row directly. The map has no row beyond it.
     addq.w  #1,d3
     moveq   #0,d5
 .height_row:
@@ -2324,8 +2351,8 @@ sc_terrain:
     lsr.w   #4,d1
     bra.s   .height_ready
 .subcolumn:
-    ; D2/D0 are free during interpolation; reload the original X/Z
-    ; before the XYZ store. D3/D5 hold fx/fz, and D4 is the height column.
+    ; D3.W and D5.W contain the X and Z fractions. D4.W contains the source column.
+    ; Restore the current Z in D2.W after the two interpolation steps.
     move.w  d4,d3
     lsr.w   #8,d3
     andi.w  #SC_TILE_MASK,d3
@@ -2337,7 +2364,7 @@ sc_terrain:
     sub.w   d1,d2
     muls.w  d3,d2
     lsl.w   #4,d1
-    add.w   d2,d1              ; top X edge, still scaled by 16
+    add.w   d2,d1                     ; Keep this X interpolation at scale 16.
     moveq   #0,d2
     moveq   #0,d0
     move.b  SC_MAP_SIDE(a6,d4.w),d2
@@ -2358,8 +2385,7 @@ sc_terrain:
     dbra    d6,.vertex_column
     bra.w   .advance_vertex_row
 .lattice_row:
-    ; A lattice Z row cannot require any Z interpolation. Both paths
-    ; keep D1.W in the unsigned height-byte range.
+    ; At an exact Z node, interpolate only in X. The height fits in an unsigned byte.
     moveq   #0,d1
     cmpa.w  #-1,a4
     beq.s   .lattice_point
@@ -2375,7 +2401,7 @@ sc_terrain:
     rept 8
     move.b  (a1)+,(a5)+
     endr
-    ; Retain the original generic handling of the last three columns.
+    ; Use the general X lookup for the final three columns.
     lea     16(a0),a0
     moveq   #2,d6
 .lattice_point:
@@ -2390,8 +2416,8 @@ sc_terrain:
     SC_LATTICE_HEIGHT_EDGE
     bra.s   .lattice_store
 .duplicate_row:
-    ; Clamping pads the grid at a repeated Z. Same X/Z gives exactly
-    ; the preceding row's packed XYZ, including all rounded heights.
+    ; Padding repeats the previous Z coordinate. Copy its height bytes without
+    ; interpolation.
     addq.l  #2,a3
     lea     -SC_GRID_WIDTH(a5),a1
     rept SC_GRID_WIDTH/4
@@ -2403,14 +2429,14 @@ sc_terrain:
     lea     2*SC_GRID_WIDTH(sp),sp
 
     lea     sc_grid_z(a2),a3
-    lea     sc_strip(a2),a5      ; each original tile slot is {kind, solid ink}
+    lea     sc_strip(a2),a5           ; Each tile word holds its kind and solid ink.
     lea     sc_needed(a2),a0
     lea     .need_prefix(pc),a1
-    ; A4/A6 are the active X and material pointers during row emission.
-    ; Address rows by the existing downward counter from the final slot.
-    moveq   #0,d5              ; previous row's admitted cell count
-    ; sc_foot_axis emits its upper endpoint followed only by repeats.
-    ; Trim that suffix once: D4 high word retains last active interval.
+    ; A4 and A6 point to X coordinates and material bytes. The row counter counts
+    ; backward.
+    moveq   #0,d5                     ; Start with zero admitted cells in the previous row.
+    ; Discard the repeated high X endpoints. Keep the last active interval in the
+    ; upper word of D4.
     lea     sc_grid_x+SC_GRID_X_END(a2),a4
     move.w  (a4),d2
     moveq   #SC_GRID_WIDTH-2,d4
@@ -2418,7 +2444,7 @@ sc_terrain:
     cmp.w   -(a4),d2
     dbne    d4,.trim_x
     swap    d4
-    move.w  #$0400,d4          ; ordinary kind in the existing record's high byte
+    move.w  #$0400,d4                 ; Put the ordinary cell kind in the high byte.
     moveq   #SC_GRID_DEPTH-2,d7
 .frow:
     move.w  (a3)+,d2
@@ -2426,7 +2452,7 @@ sc_terrain:
     beq.s   .padded_row
     addi.w  #SC_MAP_EDGE,d2
     andi.w  #(SC_MAP_CELLS-1)*SC_TILE_SIZE,d2
-    add.w   d2,d2              ; 32 cell bytes per world row
+    add.w   d2,d2                     ; Convert the source row to a 32-byte material offset.
     lea     sc_grid_x(a2),a4
     move.w  (a4),d3
     addi.w  #SC_MAP_EDGE,d3
@@ -2441,9 +2467,9 @@ sc_terrain:
     swap    d6
     tst.w   d6
     bmi.s   .padded_row
-    ; The actual last endpoint also occupies every high padding slot.
-    ; If its high-X/high-Z corner is inside, strict X/Z increase makes
-    ; every active cell ordinary, including equality at that endpoint.
+    ; The final slot contains the upper endpoint even when the row has padding.
+    ; If the high-X, high-Z corner is inside, all active cells are ordinary. This
+    ; includes equality.
     move.w  sc_grid_x+SC_GRID_X_END(a2),d2
     add.w   d1,d2
     bgt.s   .partial_material_row
@@ -2465,18 +2491,20 @@ sc_terrain:
     bgt.s   .diagonal
     move.w  d4,d2
 .record:
-    move.b  (a6)+,d2           ; retain kind, replace the low byte with resolved ink
+    move.b  (a6)+,d2                  ; Keep the kind byte and replace the ink byte.
     move.w  d2,(a5)+
     dbra    d6,.fcol
-    ; Track completed intervals even when the physical X bound ran out
-    ; before all original strip slots. DBRA leaves D6=-1 here.
+    ; Count complete intervals even when the clipped X endpoint comes before the last
+    ; slot.
+    ; After DBRA completes the full loop, D6.W is -1.
     bra.s   .padded_column
 .diagonal:
     move.w  #$0500,d2
     bra.s   .record
 .padded_column:
-    ; Admitted prefix length = initial counter minus live counter.
-    ; Both diagonal rejection and a trimmed X suffix end here.
+    ; Subtract the current counter from its initial value to get the admitted cell
+    ; count.
+    ; Diagonal rejection and a trimmed X suffix use the same exit.
     move.l  d4,d2
     swap    d2
     sub.w   d6,d2
@@ -2491,14 +2519,13 @@ sc_terrain:
     clr.w   (a5)+
     dbra    d6,.pad
 .row_advance:
-    ; Publish this cell row's individual count before the vertex union.
-    ; 68000 displacement for indexed addressing is only signed 8-bit.
-    ; A4 is no longer live at the row tail.
+    ; Store the admitted cell count before writing the vertex mask.
+    ; A4 can hold the count address here. The 68000 indexed displacement has only
+    ; eight signed bits.
     lea     sc_strip_row_counts(a2),a4
     move.b  d2,(a4,d7.w)
-    ; This lattice row borders both the preceding and the current cell
-    ; row. Their vertex union is exactly the wider prefix, plus the
-    ; last right vertex if nonempty. No additional coverage test.
+    ; A lattice row touches two cell rows. Use the larger of their admitted prefixes.
+    ; If this prefix contains a cell, include its rightmost vertex.
     move.w  d2,d0
     cmp.w   d5,d2
     bhs.s   .mark_needed
@@ -2507,7 +2534,8 @@ sc_terrain:
     move.w  d0,d5
     SC_WRITE_PREFIX_NEEDED
     dbra    d7,.frow
-    move.w  d5,d2             ; bottom lattice row has no following cells
+    ; Only the preceding cell row touches the final vertex row.
+    move.w  d5,d2
     SC_WRITE_PREFIX_NEEDED
     movem.l (sp)+,d2-d7/a3-a6
     rts
@@ -2526,8 +2554,8 @@ sc_need_cells set sc_need_cells+1
 ; Expanded authored route height map
 ; ------------------------------------------------------------------------
 
-; The outer belt extends the Lab's original central terrain.
-; 33 heights and 32 materials per row; origin (-256,-256).
+; The outer belt extends the original Tank Render Lab terrain.
+; The map starts at (-256, -256). Each row has 33 height nodes and 32 material cells.
 sc_heightmap:
     dc.b  1, 1, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 3, 3, 2, 1, 0, 0, 0
     dc.b  2, 3, 4, 3, 2, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 3, 4, 6, 6, 6, 4, 3, 1, 0, 0
@@ -2567,8 +2595,7 @@ sc_heightmap:
 ; Authored terrain materials
 ; ------------------------------------------------------------------------
 
-; Generated by tools/make_terrain_surface.py from the authored materials.
-; Terrain stores final inks; the inset owns its independent 3 plane image.
+; Store resolved terrain inks by cell. The map inset uses its own three bitplanes.
 sc_land_inks:
     dc.b 2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,5,5,5,5,5,5,5,5,5,5,5
     dc.b 2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,5,5,5,5,5,5,5,5,5,5,5
@@ -2603,6 +2630,7 @@ sc_land_inks:
     dc.b 2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,6,6,2,2,2,2,2,2,2,2,2,2,2
     dc.b 2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2
     even
+; Store the map inset as three planes, in screen row order.
 tb_map_planes:
     dc.l $ffffffff,$ffffffff,$ffffffff,$ffffffff
     dc.l $ffffffff,$ffffffff,$fffcffff,$ffffffff
@@ -2618,9 +2646,14 @@ tb_map_planes:
     dc.l $00000000,$00000000,$00000000,$00000000
     section code,code
 
-    ; x/z products at constant offsets in A5's prism-local cache.
-    ; D2.w/D0.w return world X/Z, truncated toward zero only after summing.
-SC_PRISM_PRODUCT_BYTES equ 2      ; authored |x|+|z|<=20, Q7 sine/cos <=128
+    ; ------------------------------------------------------------------------
+; Tank and scenery geometry
+; ------------------------------------------------------------------------
+
+; A5 points to cached products for the prism rotation.
+    ; Return world X in D2.W and world Z in D0.W. Sum the products before rounding
+    ; toward zero.
+SC_PRISM_PRODUCT_BYTES equ 2          ; The prism bounds keep all products in signed words.
 SC_PRISM_PAIR_BYTES equ 2*SC_PRISM_PRODUCT_BYTES
 
     macro SC_PRISM_XZ_BODY
@@ -2666,22 +2699,23 @@ SC_PRISM_PAIR_BYTES equ 2*SC_PRISM_PRODUCT_BYTES
     move.w  d0,\3+4(a6)
     endm
 
-; Shared prism builder: A3 origin (x,y,z), A4 word descriptor:
-; left,right,lower,upper,back,front,front-upper inset,flags,
-; packed colors for (front/back or wedge back), sides, top.
-; Flags: bit 0 suppress top, bit 1 sloping wedge.
-; D0.w angle in 256ths of turn; result D0.w first vertex.
+; Append a prism. A3 points to its origin, and A4 points to its descriptor.
+; The words give the X, Y, and Z bounds, the front upper inset, and flags. Color bytes
+; follow.
+; Flag bit 0 omits the top. Flag bit 1 selects the wedge.
+; D0.W contains yaw in 1/256 turns. Return the first vertex index in D0.W.
 sc_prism:
     movem.l d2-d7/a3-a6,-(sp)
     bsr.w   sc_prism_yaw
     bra.s   sc_prism_oriented
 
-; D4/D5: camera Z/X in part space; D6/D7: sine/cosine.
-; These four words are constant across prisms of one articulated component.
+; D4.W and D5.W contain camera Z and X in prism coordinates. D6.W and D7.W contain
+; sine and cosine.
+; Prisms on the same articulated part can reuse all four words.
 sc_prism_prepared:
     movem.l d2-d7/a3-a6,-(sp)
 sc_prism_oriented:
-    moveq   #0,d3               ; visible face bits
+    moveq   #0,d3
     cmp.w   8(a4),d4
     bge.s   .not_back
     bset    #0,d3
@@ -2694,7 +2728,7 @@ sc_prism_oriented:
     bra.s   .not_front
 .wedge_front:
     move.w  sc_camy(a2),d0
-    sub.w   2(a3),d0            ; camera relative to grounded model origin
+    sub.w   2(a3),d0                  ; Measure eye height from the model origin.
     sub.w   4(a4),d0
     ext.l   d0
     lsl.l   #2,d0
@@ -2727,8 +2761,8 @@ sc_prism_oriented:
 .mask_ready:
     move.w  d3,-(sp)
     move.w  sc_vertex_count(a2),-(sp)
-    ; Factor yaw products by the two X and three possible Z coordinates.
-    ; Keep full signed products: truncation still happens only after summing.
+    ; Cache products for the two X coordinates and three possible Z coordinates.
+    ; Keep signed products at full precision until the sum.
     lea     -5*SC_PRISM_PAIR_BYTES(sp),sp
     movea.l sp,a5
     move.w  (a4),d0
@@ -2755,8 +2789,8 @@ sc_prism_oriented:
     muls.w  d7,d1
     SC_PRISM_STORE_TERM d0,(a5)+
     SC_PRISM_STORE_TERM d1,(a5)+
-    ; The two Y levels have the same back X/Z. They also share
-    ; front X/Z when there is no upper front inset.
+    ; The upper and lower back corners share X and Z.
+    ; The front corners also share X and Z when the upper front has no inset.
     move.w  12(a4),d3
     beq.s   .output
     move.w  10(a4),d0
@@ -2779,7 +2813,7 @@ sc_prism_oriented:
     add.w   4(a4),d4
     add.w   6(a4),d5
 
-    ; Always emit indices 0..7 at their original offsets.
+    ; Keep all eight indices in the order that the face tables use.
     SC_PRISM_CORNER_PAIR 0,2,0
     SC_PRISM_CORNER_PAIR 1,2,6
     tst.w   d3
@@ -2794,15 +2828,15 @@ sc_prism_oriented:
     SC_PRISM_CORNER 1,4,42,d5
 .built:
     lea     5*SC_PRISM_PAIR_BYTES(sp),sp
-    move.w  (sp)+,d7            ; first vertex index
-    move.w  (sp)+,d6            ; visibility bits
+    move.w  (sp)+,d7
+    move.w  (sp)+,d6
     lea     sc_box_faces(pc),a5
     btst    #1,15(a4)
     beq.s   .face_table
     lea     sc_wedge_faces(pc),a5
 .face_table:
-    ; The next face record and both lookup bases remain live across
-    ; this private loop; no other producer can interleave records.
+    ; Keep the output face pointer and both lookup addresses across the loop.
+    ; No other geometry producer writes face records during this loop.
     lea     sc_model_inks(pc),a0
     lea     sc_needed(a2),a1
     move.w  sc_face_count(a2),d4
@@ -2810,14 +2844,14 @@ sc_prism_oriented:
     lsl.w   #2,d4
     lea     sc_faces(a2),a6
     adda.w  d4,a6
-    suba.l  a3,a3              ; number of emitted faces
+    suba.l  a3,a3
     moveq   #4,d5
 .face_loop:
     moveq   #0,d4
-    move.b  (a5)+,d4            ; bit number
+    move.b  (a5)+,d4
     btst    d4,d6
     beq.s   .skip_face
-    move.b  (a5)+,d4            ; offset of byte color in descriptor
+    move.b  (a5)+,d4
     move.b  (a4,d4.w),d4
     moveq   #0,d0
     moveq   #0,d1
@@ -2831,8 +2865,8 @@ sc_prism_oriented:
     add.w   d7,d1
     add.w   d7,d2
     add.w   d7,d3
-    ; Neither prism table contains a triangle. Generic builds leave
-    ; the depth word untouched until painter preparation assigns it.
+    ; Both prism face tables contain only quadrilaterals.
+    ; The face cull calculates depth from the transformed vertices.
     movem.w d0-d3,(a6)
     move.b  (a0,d4.w),d4
     ori.w   #$0400,d4
@@ -2854,16 +2888,17 @@ sc_prism_oriented:
     movem.l (sp)+,d2-d7/a3-a6
     rts
 
-; D0.w angle, A3 origin. Returns the four prepared yaw words in D4-D7;
-; clobbers D0-D3/A0. Camera and corner products retain signed Q7 rounding.
+; D0.W contains yaw and A3 points to the prism origin. Return the four rotation words
+; in D4.W-D7.W.
+; D0-D3 and A0 are scratch registers. Rotate with Q7 products and round toward zero.
 sc_prism_yaw:
     lea     sc_sin_q7(a2),a0
     andi.w  #255,d0
     add.w   d0,d0
-    move.w  (a0,d0.w),d6        ; sin yaw
+    move.w  (a0,d0.w),d6
     addi.w  #128,d0
     andi.w  #510,d0
-    move.w  (a0,d0.w),d7        ; cos yaw
+    move.w  (a0,d0.w),d7
     move.w  sc_camx(a2),d2
     sub.w   (a3),d2
     move.w  sc_camz(a2),d3
@@ -2874,14 +2909,14 @@ sc_prism_yaw:
     muls.w  d3,d1
     sub.l   d1,d0
     bsr     sc_div128
-    move.w  d0,d5               ; X view direction in model space
+    move.w  d0,d5
     move.w  d6,d0
     muls.w  d2,d0
     move.w  d7,d1
     muls.w  d3,d1
     add.l   d1,d0
     bsr     sc_div128
-    move.w  d0,d4               ; Z view direction in model space
+    move.w  d0,d4
     rts
 
 sc_div128:
@@ -2892,7 +2927,8 @@ sc_div128:
     asr.l   #7,d0
     rts
 
-; Each row: visibility bit, byte offset of color, four local vertices.
+; Each entry contains a visibility bit, a color byte offset, and four local vertex
+; indices.
 sc_box_faces:
     dc.b 0,16,0,2,3,1, 1,16,4,5,7,6, 2,17,0,4,6,2
     dc.b 3,17,1,3,7,5, 4,18,2,6,7,3
@@ -2901,8 +2937,7 @@ sc_wedge_faces:
     dc.b 1,17,4,5,7,6, 4,18,2,6,7,3
 
 sc_model:
-    ; D0 tank index. Track pair and hull yaw together; turret and gun
-    ; share their own yaw. Every part still has its original bounds.
+    ; D0 selects the tank. The tracks share hull yaw. The gun shares turret yaw.
     movem.l d2-d7/a3-a5,-(sp)
     move.w  d0,d2
     lea     sc_tank(a2),a3
@@ -2942,10 +2977,11 @@ sc_model:
     movem.l (sp)+,d2-d7/a3-a5
     rts
 
-; Prism descriptors: x range, y range, z range, top inset, flags, three colors.
-; Scale the tank prisms at assembly time to avoid per-frame work.
-; Round to the nearest model unit, resolving ties away from zero. The
-; explicit barrel dimensions keep it thin and visible.
+; The descriptor contains X, Y, and Z bounds, the upper inset, flags, and three color
+; indices.
+; Scale the prism at assembly time. Round to the nearest unit, with ties away from
+; zero.
+; The barrel uses explicit bounds to stay thin and visible.
 SC_TANK_WORD macro
     iflt \1
     dc.w -((-(\1)*3+2)/4)
@@ -2965,9 +3001,9 @@ SC_TANK_PRISM macro
     dc.w \8
     endm
 
-sc_muzzle_lead  equ 19         ; rounded from 25 × 3/4
-sc_muzzle_other equ 15         ; rounded from 20 × 3/4
-sc_barrel_y     equ 8          ; rounded from 11 × 3/4
+sc_muzzle_lead  equ 19                ; Round 25 times 3/4 to the nearest unit.
+sc_muzzle_other equ 15                ; Round 20 times 3/4 to the nearest unit.
+sc_barrel_y     equ 8                 ; Round 11 times 3/4 to the nearest unit.
 
 ; Track shading uses two repeating checker inks.
 SC_TRACK_END_TOP equ 16
@@ -2992,13 +3028,13 @@ sc_model_other:
     SC_TANK_PRISM -6,6,2,7,-9,12,4,2
     dc.b 11,12,12,0
     SC_TANK_PRISM -5,5,7,13,-5,7,4,2
-    dc.b 12,11,12,0           ; ochre turret top, matching its front
+    dc.b 12,11,12,0                   ; Use ochre on the top and front of the turret.
     dc.w -1,1,sc_barrel_y-1,sc_barrel_y+1,3,sc_muzzle_other,0,0
     dc.b 12,11,14,0
 SC_HOUSE_X equ -12
 SC_HOUSE_HALF_X equ 8
 SC_HOUSE_HALF_Z equ 7
-; Beside the road, inside the whole canned drive's moving footprint.
+; Place the spark beside the road. Its box uses the terrain footprint test.
 SC_HOUSE_Z equ 8
 sc_spark_box:
     dc.w -1,1,-1,1,-1,1,0,0
@@ -3034,8 +3070,10 @@ sc_spark_box:
     endm
 
 sc_house:
-    ; A house may only stand on a fully present foundation. Footprint
-    ; is the clipped world rectangle intersected with X+2Z <= front.
+    ; Draw the house only when its entire foundation lies inside the terrain
+    ; footprint.
+    ; The footprint is the clipped rectangle with the additional limit X + 2Z <=
+    ; front.
     cmpi.w  #SC_HOUSE_X-SC_HOUSE_HALF_X,sc_grid_x(a2)
     bgt     .done
     cmpi.w  #SC_HOUSE_X+SC_HOUSE_HALF_X,sc_grid_x+SC_GRID_X_END(a2)
@@ -3046,8 +3084,8 @@ sc_house:
     blt     .done
     cmpi.w  #SC_HOUSE_X+SC_HOUSE_HALF_X+2*(SC_HOUSE_Z+SC_HOUSE_HALF_Z),sc_front_dx(a2)
     blt     .done
-    ; The house never rotates: sin[0]=0 and cos[0]=128 in Q7.
-    ; Emit the already oriented mesh in the same vertex and face order.
+    ; The house has zero yaw. Its Q7 sine is zero, and its cosine is 128.
+    ; Write the corners in face-table order.
     movem.l d2-d6,-(sp)
     move.w  sc_house_ground,d1
     move.w  d1,d4
@@ -3063,7 +3101,7 @@ sc_house:
     adda.w  d3,a0
 
     rept 2
-    ; Rept index selects the back or front half of the carcase.
+    ; The repeat index selects the rear or front half of the house walls.
     SC_HOUSE_CORNER SC_HOUSE_X-SC_HOUSE_HALF_X,d1,SC_HOUSE_Z-SC_HOUSE_HALF_Z+(2*SC_HOUSE_HALF_Z)*REPTN
     SC_HOUSE_CORNER SC_HOUSE_X+SC_HOUSE_HALF_X,d1,SC_HOUSE_Z-SC_HOUSE_HALF_Z+(2*SC_HOUSE_HALF_Z)*REPTN
     SC_HOUSE_CORNER SC_HOUSE_X-SC_HOUSE_HALF_X,d4,SC_HOUSE_Z-SC_HOUSE_HALF_Z+(2*SC_HOUSE_HALF_Z)*REPTN
@@ -3094,7 +3132,7 @@ sc_house:
     SC_HOUSE_WALL 1,3,7,5,15,4*SC_HOUSE_Z
 .not_right:
     move.w  d5,d6
-    addq.w  #8,d6              ; first ridge vertex
+    addq.w  #8,d6
 
     move.w  d5,d0
     addq.w  #2,d0
@@ -3138,11 +3176,12 @@ sc_house:
 .done:
     rts
 
-; D0 ground x, D1 ground z, D2 top height. Authored grove supplies
-; the immutable base height in D3.W. A2 scene.
+; D0.W and D1.W contain ground X and Z. D2.W is canopy height. D3.W is the sampled
+; base height.
+; A2 contains the scene address.
 sc_tree:
-    ; Admit the complete ground-contact span. Crown and walls still
-    ; use the ordinary screen clip after projection.
+    ; Require the complete ground contact to lie inside the footprint.
+    ; The screen clip still applies to the canopy and trunk after projection.
     subq.w  #3,d0
     cmp.w   sc_grid_x(a2),d0
     blt     .done
@@ -3160,12 +3199,10 @@ sc_tree:
     bgt     .done
     move.w  a0,d0
     subq.w  #3,d0
-    ; A tree always emits these exact four vertices and the same two
-    ; triangle records. Reserve each entire array slice once rather
-    ; than invoking a generic append for every vertex and face.
+    ; Reserve four vertex records and two triangle records before writing them.
     movem.l d3-d5,-(sp)
-    move.w  d3,d5               ; base height from the once-sampled grove
-    move.w  d2,d3               ; canopy height above local ground
+    move.w  d3,d5
+    move.w  d2,d3
     move.w  d1,d2
     move.w  d5,d1
     move.w  sc_vertex_count(a2),d4
@@ -3213,15 +3250,15 @@ sc_tree:
     addq.w  #1,d0
     move.w  d0,(a0)+
     move.w  d0,(a0)+
-    move.w  #$0306,(a0)+        ; triangle, resolved canopy ink 6
-    addq.l  #2,a0               ; depth is preserved until the cull stage
+    move.w  #$0306,(a0)+              ; Set the canopy triangle to ink 6.
+    addq.l  #2,a0                     ; Leave the depth slot for the face cull.
     move.w  d0,(a0)+
     subq.w  #1,d0
     move.w  d0,(a0)+
     addq.w  #2,d0
     move.w  d0,(a0)+
     move.w  d0,(a0)+
-    move.w  #$0302,(a0)         ; triangle, resolved trunk ink 2
+    move.w  #$0302,(a0)               ; Set the trunk triangle to ink 2.
     lea     sc_needed(a2),a0
     adda.w  d4,a0
     moveq   #1,d0
@@ -3233,10 +3270,8 @@ sc_tree:
 .done:
     rts
 
-; Four authored trees across the whole map. Two original west-bank
-; neighbours form a grove, with one by the house and one on the far bank.
-; Because there are only four placements globally, no grid window can
-; contain more, irrespective of camera or player position. Triples are X/Z/height.
+; The map has four fixed trees. Their placement limits the view to four trees.
+; Each entry gives X, Z, and canopy height.
 sc_grove:
     dc.w -16,-16,24
     dc.w -19,-31,18
@@ -3245,8 +3280,9 @@ sc_grove:
 sc_grove_end:
 SC_GROVE_COUNT equ (sc_grove_end-sc_grove)/6
 
-; Seed only immutable authored placements, using the exact map sampler.
-; Per-frame footprint/camera admission and all emitted records remain live.
+; Sample the ground at each fixed tree position. The height does not depend on the
+; camera.
+; The terrain footprint test still runs each frame.
 sc_seed_prop_heights:
     moveq   #SC_HOUSE_X,d0
     moveq   #SC_HOUSE_Z,d2
@@ -3278,10 +3314,10 @@ sc_scenery_grove:
     movea.l (sp)+,a5
     rts
 
+; Build terrain, tanks, scenery, and the tracer for the current camera position.
 sc_make_scene:
     movem.l d2-d4/a3-a4,-(sp)
-    ; Bulk terrain ownership writes all grid flags before any reader.
-    ; Only the following model flags still need an initial zero.
+    ; The terrain pass assigns all grid flags. Clear only the model flags here.
     lea     sc_needed+SC_GRID_POINTS(a2),a0
     moveq   #0,d0
     move.w  #(SC_MAX_VERTICES-SC_GRID_POINTS)/4-1,d1
@@ -3321,14 +3357,14 @@ sc_make_scene:
 ; Turret aim and tracer motion
 ; ------------------------------------------------------------------------
 
-; Visual benchmark animation. No aiming feedback from the raster or timer.
-SC_TURRET_STEP  equ 4                   ; binary angle units per simulation tick
-SC_TRACER_TICKS equ 12                  ; shorter than the 16-tick launch spacing
-SC_LEAD_FIRE    equ 8                   ; single tracer slot, deliberately staggered
+; The simulation sets turret aim. The raster and FPS timer do not affect it.
+SC_TURRET_STEP  equ 4                 ; Limit turret yaw change to four units per tick.
+SC_TRACER_TICKS equ 12                ; Expire the tracer before the next launch.
+SC_LEAD_FIRE    equ 8                 ; Stagger launches so one tracer record is enough.
 SC_OTHER_FIRE   equ 24
 
-; The cached position macros still own hull motion. Add height and independent
-; turret yaw after both positions have been produced by the same tick.
+; Sample the ground at both tank positions. Then update turret aim and the active
+; tracer.
 sc_ground_and_aim:
     move.w  sc_tank(a2),d0
     move.w  sc_tank+4(a2),d2
@@ -3345,7 +3381,7 @@ sc_ground_and_aim:
     sub.w   sc_tank+4(a2),d1
     bsr.s   sc_target_yaw
     move.b  d0,d6
-    addi.b  #128,d0              ; reciprocal sight line for the second turret
+    addi.b  #128,d0                   ; Use the reverse sight line for the second turret.
     move.b  d0,d7
     tst.l   sc_tick(a2)
     beq.s   .reset
@@ -3389,9 +3425,10 @@ sc_ground_and_aim:
     movem.l (sp)+,d4-d7
     rts
 
-; D0.w=target X delta, D1.w=target Z delta => D0.b angle (zero points +Z).
-; Tank centres are at most 83 units apart per component. Take atan of the
-; first-octant ratio, followed by exact symmetry of the quadrants.
+; D0.W contains the X delta and D1.W contains the Z delta. Return yaw in D0.B, with
+; zero along positive Z.
+; Use the first-octant ratio to index the table. Apply angle symmetry to cover the
+; full turn.
 sc_target_yaw:
     move.w  d0,d2
     move.w  d1,d3
@@ -3432,7 +3469,8 @@ sc_target_yaw:
 .done:
     rts
 
-; D0.b target, (A1) current; signed byte subtraction takes the short arc.
+; D0.B contains the target yaw and A1 points to the current yaw. Signed byte
+; subtraction selects the shorter turn.
 sc_slew_yaw:
     sub.b   (a1),d0
     cmpi.b  #SC_TURRET_STEP,d0
@@ -3447,8 +3485,8 @@ sc_slew_yaw:
     add.b   d0,(a1)+
     rts
 
-; D0.w source tank. Match the rendered zero-local-X front face of the barrel.
-; Position uses the prism's integer truncation; each tick uses its Q7 heading.
+; D0.W selects the source tank. Start the tracer at the center of the barrel end.
+; Match the prism rounding at launch. Use the Q7 heading for subsequent movement.
 sc_launch_tracer:
     move.w  d0,sc_tracer_tank(a2)
     lea     sc_turret_yaw(a2),a0
@@ -3492,8 +3530,8 @@ sc_launch_tracer:
     move.w  #SC_TRACER_TICKS,sc_tracer_life(a2)
     rts
 
-; Draw one bright moving spark within the scenery window. The
-; clip here is visual only; the replay does not depend on the viewport.
+; Draw the tracer only inside the terrain footprint. This test does not change the
+; simulation.
 sc_draw_tracer:
     tst.w   sc_tracer_life(a2)
     beq.s   .done
@@ -3531,8 +3569,11 @@ sc_yaw_atan:
 
     xdef tb_scene_prepare_draw,tb_scene_emit_draw
 
-    ; Generic coarse exclusion on sign-extended camera Q4 words.
-    ; Individual bounds, including equality, are shared by both layouts.
+; ------------------------------------------------------------------------
+; Model transforms and terrain projection
+; ------------------------------------------------------------------------
+
+    ; Test near-plane exclusion on a sign-extended Q4 camera depth.
     macro SC_COARSE_NEAR
     moveq   #0,\2
     cmpi.l  #SC_NEAR,\1
@@ -3542,7 +3583,7 @@ sc_yaw_atan:
     endm
 
     macro SC_COARSE_LR
-    ; D2-style Z input is replaced by negative twice depth.
+    ; Use twice the camera depth for each side limit.
     add.l   \1,\1
     cmp.l   \1,\2
     ble.s   .not_right\@
@@ -3556,7 +3597,7 @@ sc_yaw_atan:
     endm
 
     macro SC_COARSE_TB
-    ; Input plane limit is five times signed Z, and scale Y by four.
+    ; Scale Y by four and compare it with the limits at five times the camera depth.
     lsl.l   #2,\2
     cmp.l   \1,\2
     ble.s   .not_above\@
@@ -3569,10 +3610,10 @@ sc_yaw_atan:
 .done\@:
     endm
 
-; D4.w projected X, D1.w projected Y, A4 outcode byte. The caller
-; has already projected this point; bit 5 selects the general viewport path.
+; D4.W and D1.W contain projected X and Y. A4 points to the outcode byte.
+; Set bit 5 when the point requires the general viewport path.
     macro SC_TAG_VIEWPORT
-    subi.w  #9,d4               ; one-pixel margin for quantized endpoints
+    subi.w  #9,d4                     ; Allow for endpoint rounding at the left edge.
     cmpi.w  #5103,d4
     bhi.s   .unpacked\@
     move.w  d1,d4
@@ -3584,11 +3625,11 @@ sc_yaw_atan:
 .inside\@:
     endm
 
-; Same signed Q4 reciprocal calculation, with late range/height fallback.
-; Keep the fixed origins in A0/A1 for the model vertex walk.
+; Use the reciprocal table for eligible model points. A0 and A1 hold the fixed screen
+; origins.
     macro SC_ALIGNED_MODEL_POINT
     tst.w   d1
-    bgt.s   \2 ; above-eye models keep the general projector
+    bgt.s   \2                        ; Use the general projector for points above the eye.
     lsr.w   #3,d2
     cmpi.w  #1022,d2
     bhi.s   \1
@@ -3596,8 +3637,8 @@ sc_yaw_atan:
     move.w  d4,d2
     asr.w   #4,d0
     asr.w   #4,d1
-    neg.w   d1                   ; integral positive height below the eye
-    ; Small integral operands as MULS sources reduce Booth transitions.
+    neg.w   d1                        ; Use positive height below the eye.
+    ; Use the small integer as the MULS source to reduce Booth transitions.
     muls.w  d0,d4
     muls.w  d1,d2
     move.l  d4,d0
@@ -3605,25 +3646,25 @@ sc_yaw_atan:
     addi.l  #255,d0
 .positive\@:
     asr.l   #8,d0
-    ; Both the below-eye height and authored reciprocal are nonnegative.
+    ; Both factors of the vertical product are nonnegative.
     asr.l   #8,d2
-    ; The aligned camera keeps its origins fixed.
+    ; Add the fixed screen origins.
     add.l   a0,d0
     move.l  d2,d1
     add.l   a1,d1
     endm
 
-; A2 scene, D3 mode. Transforms needed camera-space points. The typed
-; authored model path also projects them here; generic admission projects
-; later, after culling. The separable terrain path handles its own grid.
+; A2 contains the scene address. Transform marked model vertices and record their
+; frustum outcodes.
+; The face cull marks vertices again for projection. Terrain stays in the separate
+; axis and height arrays.
 sc_transform_scene:
     movem.l d2-d7/a3-a6,-(sp)
-    move.w  d3,d7
     lea     sc_world_vertices(a2),a3
     lea     sc_camera_vertices(a2),a4
     lea     sc_needed(a2),a5
     move.w  sc_vertex_count(a2),d6
-    ; Terrain consumes the existing axes and byte heights directly.
+    ; Skip the terrain prefix in each model array.
     lea     6*SC_GRID_POINTS(a3),a3
     lea     6*SC_GRID_POINTS(a4),a4
     move.w  sc_camx(a2),d4
@@ -3633,8 +3674,7 @@ sc_transform_scene:
     lea     SC_GRID_POINTS(a5),a5
     subi.w  #SC_GRID_POINTS+1,d6
     bmi.s   .models_done
-    ; D4/D5/D7 still hold camera X, Yq4, Z. Only the packed
-    ; words survive, so sign extension and the general call are dead.
+    ; D4.W and D7.W contain camera X and Z. D5.W contains camera Y in Q4.
     lea     sc_outcode+SC_GRID_POINTS(a2),a0
 .model_vertex:
     tst.b   (a5)+
@@ -3649,8 +3689,8 @@ sc_transform_scene:
     sub.w   4(a3),d2
     lsl.w   #4,d2
     movem.w d0-d2,(a4)
-    ; Classify from the same signed Q4 words just published. Only the
-    ; shared face walk will restore the needed marks for visible faces.
+    ; Use the packed Q4 coordinates for the outcode. Remove the input mark before the
+    ; face cull restores it.
     clr.b   -1(a5)
     ext.l   d2
     movea.l d2,a1
@@ -3675,8 +3715,10 @@ sc_transform_scene:
     movem.l (sp)+,d2-d7/a3-a6
     rts
 
-    ; D4 typed height, D3 camera Y, D0/D6 row coefficients -> D1
-    ; exact screen Y. The previous height in D5 tags the saved result.
+    ; D4.W contains terrain height, D3.W contains camera Y, and D0.W/D6.L hold the row
+    ; coefficients.
+    ; Return the exact screen Y in D1.L. Set D5.W to the height so the next point can
+    ; test for reuse.
     macro SC_TYPED_ELEVATION
     move.w  d4,d5
     move.w  d3,d1
@@ -3688,8 +3730,8 @@ sc_transform_scene:
     ext.l   d1
     endm
 
-    ; One row of the exact affine terrain projection. Argument 0 is
-    ; legal only when the entire row is already inside the raster.
+    ; Project the marked terrain points. Argument 0 skips viewport tags for a row
+    ; inside the raster.
     macro SC_ELEVATION_POINTS
     moveq   #SC_GRID_WIDTH-1,d7
 .point\@:
@@ -3699,9 +3741,9 @@ sc_transform_scene:
     else
     beq.s   .skip\@
     endif
-    ; X is already exact from the row recurrence. Authored strip depth
-    ; is >=96, so it never needs the general model near-plane case.
-    ; Tagged rows reuse D4 for screen X/Y; the far loop does not.
+    ; The row recurrence supplies exact X. Terrain depth is at least 96, so near-plane
+    ; clipping is unnecessary.
+    ; Rows that need a viewport test use D4.W for the X and Y tests.
     ifne \1
     moveq   #0,d4
     endif
@@ -3728,29 +3770,33 @@ sc_transform_scene:
     dbra    d7,.point\@
     endm
 
-    ; The producer writes a contiguous need prefix: a set final byte
-    ; certifies there is no inactive point in this row.
-    ; This group only handles far rows and never writes viewport tags.
+    ; A mark in the final slot proves that the entire prefix fills the row.
+    ; This loop handles full far rows and does not write viewport tags.
     macro SC_ELEVATION_FULL_POINT
     move.b  \1(a3),d4
     cmp.w   d5,d4
-    beq.s   .store\@           ; D1 is unmodified since the preceding point
+    beq.s   .store\@                  ; D1.L still holds Y for this height.
     SC_TYPED_ELEVATION
 .store\@:
     move.l  d1,4+8*\1(a6)
     endm
 
+; Prepare the scene and order its faces. At entry, 4(SP) holds the scene address and
+; 8(SP) holds the projection mode.
+; Start the last plane clear after scene construction. Transform and sort while it
+; runs.
 tb_scene_prepare_draw:
     movem.l d2-d7/a2-a6,-(sp)
     movea.l 48(sp),a2
     move.l  52(sp),sc_draw_mode(a2)
     bsr     sc_make_scene
-    bsr.w   play_clear_final    ; Scene construction overlapped plane 1.
+    ; Scene construction overlaps the preceding plane clear.
+    bsr.w   play_clear_final
     move.l  sc_draw_mode(a2),d3
     bsr     sc_transform_scene
-    ; Camera-relative strip depth is >=96. With map heights 0..21 and
-    ; eye 44..65, the ordinary coarse frustum cannot reject any tile.
-    ; Fill the actual viewport tag after projection, as before.
+    ; The minimum terrain depth is 96. With heights [0, 21] and eye heights [44, 65],
+    ; the coarse frustum cannot reject terrain.
+    ; Set the viewport outcode after projection.
     lea     sc_outcode(a2),a4
     moveq   #SC_GRID_POINTS/4-1,d7
 .strip_outcode:
@@ -3761,12 +3807,13 @@ tb_scene_prepare_draw:
     lea     sc_order(a2),a6
     moveq   #0,d7
     moveq   #SC_GRID_DEPTH-2,d0
-    ; Preserve each admitted row's end for the near-to-far object merger.
+    ; Save each admitted row end for the painter merge.
     lea     -SC_TERRAIN_ROW_END_BYTES(sp),sp
     movea.l sp,a1
 .strip_row:
-    ; Each two-instruction slot is four bytes; start N slots from end.
-    ; D2 always starts at the physical row base, even for a partial run.
+    ; Each unrolled slot occupies four bytes. Jump back by four bytes for each
+    ; admitted cell.
+    ; D2.W starts with the first face ID of the physical row.
     moveq   #0,d1
     move.b  -(a3),d1
     neg.w   d1
@@ -3791,22 +3838,22 @@ tb_scene_prepare_draw:
     subi.w  #sc_order,d0
     lsr.w   #1,d0
     move.w  d0,sc_draw_count(a2)
-    move.l  a6,-(sp)            ; end of terrain admission, needed by painter
+    move.l  a6,-(sp)                  ; Save the end of the admitted terrain IDs.
     move.w  sc_grid_z(a2),d6
     andi.w  #-SC_TILE_SIZE,d6
-    ; Reuse one camera-Z sum for both painter keys. These bases have
-    ; no other use until the admitted-face loop completes.
+    ; Reuse the camera Z term for both face sort keys.
     lea     sc_camera_vertices+4(a2),a1
     lea     sc_sort_work(a2),a0
     move.w  sc_camz(a2),d4
     sub.w   d6,d4
     move.w  d4,d6
-    lsl.w   #6,d6               ; four Q4 copies of camera minus grid origin
+    ; Scale four copies of camera Z minus grid origin to Q4.
+    lsl.w   #6,d6
     lea     sc_faces+12*SC_CLASS_TERRAIN_FACES(a2),a3
     lea     sc_outcode(a2),a4
     lea     sc_needed(a2),a5
 .cull_face:
-    tst.b   8(a3)              ; padded footprint slot, not a face
+    tst.b   8(a3)                     ; Reject a padding slot.
     beq.w   .skip_face
     movem.w (a3),d0-d3
     move.b  (a4,d0.w),d4
@@ -3818,9 +3865,7 @@ tb_scene_prepare_draw:
     move.b  #1,(a5,d1.w)
     move.b  #1,(a5,d2.w)
     move.b  #1,(a5,d3.w)
-    ; With authored coarse admission, sc_face and the batch tree
-    ; producer already marked all accepted model vertices (and no
-    ; padded records). Generic admission still rebuilds that mask.
+    ; The face cull marks only model vertices that belong to a surviving face.
     move.w  d0,d4
     add.w   d0,d0
     add.w   d4,d0
@@ -3837,16 +3882,15 @@ tb_scene_prepare_draw:
     add.w   d3,d3
     add.w   d4,d3
     add.w   d3,d3
-    ; Aligned world Z is integral, and the authored scene keeps world
-    ; Z within ±256, camera Z in [165,235], and grid origin in ±128.
-    ; Four camera distances in Q4 sum within signed words (max 31424).
-    ; Four world-minus-grid distances in Q4 also fit (max 24576).
+    ; Sum four camera depths in Q4. The scene bounds keep this sum in a signed word.
+    ; Subtract that sum from the common camera term to get the distance from the first
+    ; grid band.
     move.w  (a1,d0.w),d0
     add.w   (a1,d1.w),d0
     add.w   (a1,d2.w),d0
     add.w   (a1,d3.w),d0
     move.w  d6,d5
-    sub.w   d0,d5               ; exact Q4 sum of world Z minus grid origin
+    sub.w   d0,d5                     ; Calculate four Q4 distances from the grid origin.
     bpl.s   .scale_band_q4
     moveq   #0,d5
 .scale_band_q4:
@@ -3860,7 +3904,8 @@ tb_scene_prepare_draw:
     move.w  d7,d5
     add.w   d5,d5
     move.w  d4,(a0,d5.w)
-    ; No signed-division bias: all four addends are exact multiples of 16.
+    ; All four depths are multiples of 16. Divide by four without a rounding
+    ; correction.
     asr.w   #2,d0
     move.w  d0,10(a3)
     move.w  d7,(a6)+
@@ -3872,41 +3917,40 @@ tb_scene_prepare_draw:
     blo     .cull_face
 
     bsr.w   sc_project_grid_x
-    ; D3 is free until the later model loop reloads the draw mode.
+    ; Keep camera Y in D3.W until the model pass uses D3 for the projection mode.
     move.w  sc_camy(a2),d3
     lea     sc_strip_heights(a2),a3
     pea     sc_grid_z(a2)
     lea     sc_projected(a2),a6
     lea     sc_elevation_magic-8*SC_FOOT_NEAR,a0
-    moveq   #0,d5               ; previous (camera Y,Z), impossible Z=0
     moveq   #SC_GRID_DEPTH-1,d2
 .elevation_row:
-    ; The aligned strip transform publishes one depth for every row.
-    ; Even a padded row keeps valid depth in [96,304]. Keep the same
-    ; coefficient pair for all twelve points instead of reloading it
-    ; at every change of elevation.
+    ; All points in a row share camera depth. Even padding has a valid depth in [96,
+    ; 304].
+    ; Load the two row coefficients once and reuse them for all 12 slots.
     movea.l (sp),a1
     move.w  sc_camz(a2),d4
     sub.w   (a1)+,d4
     move.l  a1,(sp)
     lsl.w   #3,d4
-    moveq   #-1,d5              ; new row: no previous height result
+    moveq   #-1,d5                    ; Set a height sentinel for the new row.
     move.w  (a0,d4.w),d0
     move.l  4(a0,d4.w),d6
     ifne (SC_CX-2560)|(SC_CAMERA_ORIGIN_Y-1216)|(SC_FOCUS_Q4-4096)|(SC_EYE_HEIGHT-44)|(SC_FOOT_WEST-56)|(SC_FOOT_EAST-100)
     fail "Recheck far terrain row tag bounds after camera or footprint changes"
     endif
-    ; This is the same integer camera and height bound as the exact
-    ; elevation table. At d>=161, X spans [16,4010] Q4 or less and
-    ; Y spans [1216,2870] Q4 or less; neither margin test can set bit 5.
+    ; For depth 161 or greater, screen X stays in [16, 4010] Q4 and screen Y stays in
+    ; [1216, 2870] Q4.
+    ; Neither margin test can set bit 5 in this range.
     cmpi.w  #8*161,d4
     bge.s   .far_elevation
     SC_ELEVATION_POINTS 1
 .near_elevation_done:
     bra.w   .next_elevation
 .skip_elevation_suffix:
-    ; A5 already consumed the first zero. D7 is the number of following
-    ; slots and the producer's contiguous prefix leaves all of them inactive.
+    ; A5 points after the first zero mark. The continuous prefix proves all following
+    ; slots are inactive.
+    ; D7.W contains the number of slots after the first zero.
     adda.w  d7,a5
     addq.w  #1,d7
     adda.w  d7,a3
@@ -3915,7 +3959,8 @@ tb_scene_prepare_draw:
     adda.w  d7,a6
     bra.s   .near_elevation_done
 .far_elevation:
-    moveq   #0,d4              ; no tag check will change the height word
+    ; Initialize the upper byte. No viewport test changes this word.
+    moveq   #0,d4
     ifne SC_GRID_WIDTH-12
     fail "Full far path requires four groups of three lattice points"
     endif
@@ -3943,12 +3988,13 @@ tb_scene_prepare_draw:
     move.w  sc_vertex_count(a2),d7
     subi.w  #SC_GRID_POINTS+1,d7
     bmi.w   .points_done
-    ; The whole suite uses the reciprocal projector. Individual points
-    ; that do not fit the fast word multiply use the general projector.
+    ; Use reciprocal projection for model points within its limits. Use the general
+    ; projector for the other points.
     move.l  sc_draw_mode(a2),d3
     movea.w #SC_CX,a0
     movea.w #SC_CAMERA_ORIGIN_Y,a1
-    ; A5 needed bits, A4 outcodes, A3 camera points, A6 projected points.
+    ; A5, A4, A3, and A6 point to vertex marks, outcodes, camera coordinates, and
+    ; screen coordinates.
 .typed_next:
     tst.b   (a5)+
     beq.s   .typed_skip
@@ -3966,7 +4012,7 @@ tb_scene_prepare_draw:
     dbra    d7,.typed_next
     bra.s   .points_done
 .typed_restore_depth:
-    lsl.w   #3,d2             ; restore the original Q4 depth
+    lsl.w   #3,d2                     ; Restore Q4 depth before the general call.
 .typed_ordinary:
     bsr.w   sc_project
     movea.w #SC_CAMERA_ORIGIN_Y,a1
@@ -3983,32 +4029,29 @@ tb_scene_prepare_draw:
 ; Depth-ordered model and terrain submissions
 ; ------------------------------------------------------------------------
 
-; The Conqueror-class camera has fixed yaw: increasing world Z approaches
-; the camera across rows, while increasing X recedes within a row.
+; Camera yaw is fixed. Greater world Z puts a row nearer the camera.
+; Within a row, greater world X puts a tile farther from the camera.
 SC_LAST_ROW equ SC_GRID_DEPTH-2
 SC_BUCKET_STRIDE equ 2*(SC_MAX_FACES-SC_CLASS_TERRAIN_FACES)
 SC_DEPTH_SHADOW_BYTES equ SC_BUCKET_STRIDE
     ifne SC_TILE_SIZE-16
-    fail "Object band packing requires 16-world-unit bands."
-    endif
-    ifgt SC_MAX_FACES-256
-    fail "Object bucket records need eight-bit face IDs."
+    fail "Revise the painter bands and regenerate the terrain X table."
     endif
 SC_BUCKET_CURSOR_BYTES equ 4*(SC_LAST_ROW+1)
 SC_BUCKET_BYTES equ (SC_LAST_ROW+1)*SC_BUCKET_STRIDE+SC_BUCKET_CURSOR_BYTES
 
-; A5 is the end of the terrain admission prefix. The caller places
-; SC_TERRAIN_ROW_END_BYTES of row-end pointers just beyond the return
-; address. Preserves no scratch registers, including A2 (scene is saved
-; by tb_scene_prepare_draw).
+; A2 points to the scene. A5 points past the admitted terrain face IDs.
+; The caller puts the row-end pointers immediately above the return address.
+; This routine writes the final order to sc_sort_work.
+; This routine can change D0-D7 and A0-A6. The caller saves A2.
 sc_order_faces:
     move.w  sc_draw_count(a2),d6
     beq.w   .empty
     lea     sc_order(a2),a3
     add.w   d6,d6
     lea     (a3,d6.w),a6
-    ; Route each admitted ID once. Bands already partition the keys, so
-    ; only the signed depth is needed inside a bucket; ties keep source order.
+    ; Put each model face ID in its depth band.
+    ; Within a band, sort by depth and keep source order for equal depths.
     lea     -SC_DEPTH_SHADOW_BYTES(sp),sp
     lea     -2*SC_CLASS_TERRAIN_FACES(sp),a1
     lea     -SC_BUCKET_BYTES(sp),sp
@@ -4019,13 +4062,14 @@ sc_order_faces:
     move.l  a0,(a3)+
     lea     SC_BUCKET_STRIDE(a0),a0
     dbra    d2,.init
-    move.l  a5,d7              ; preserve the end of the terrain prefix
+    ; Save the end of the admitted terrain face IDs.
+    move.l  a5,d7
     lea     sc_sort_work(a2),a5
     lea     sc_faces+10(a2),a3
     movea.l d7,a0
-    ; Within a nonclamped 16-unit Z band, (base-depth) & 255
-    ; increases monotonically by four for every S16 depth step.
-    ; Base is the frame camera depth relative to the aligned grid origin.
+    ; The base is the camera depth relative to the aligned grid origin.
+    ; Each interior band covers 16 world units.
+    ; In that band, increasing low-byte (base - depth) gives descending depth.
     move.w  sc_camz(a2),d6
     move.w  sc_grid_z(a2),d4
     andi.w  #-SC_TILE_SIZE,d4
@@ -4040,7 +4084,8 @@ sc_order_faces:
     move.w  d0,d2
     add.w   d2,d2
     add.w   d0,d2
-    add.w   d2,d2              ; face ID * 12
+    ; D2 is now the byte offset of the face record.
+    add.w   d2,d2
     moveq   #SC_LAST_ROW,d1
     sub.w   (a5,d0.w),d1
     add.w   d1,d1
@@ -4057,6 +4102,8 @@ sc_order_faces:
 .commit:
     move.l  a4,(sp,d1.w)
     bra.s   .scatter
+; Bands at the limits can span more than 16 units.
+; Keep their full signed depths in the stack array.
 .full_depth:
     move.w  (a3,d2.w),(a1,d0.w)
     move.w  d5,(a4)+
@@ -4074,10 +4121,9 @@ sc_order_faces:
     beq.s   .item
     tst.w   d3
     beq.s   .item
-    ; Interior buckets only, with at least two faces in this bucket.
-    ; The previous bucket cannot have exhausted its global-face-count
-    ; capacity, so its last word is private unused space. A zero
-    ; unsigned key stops the walk without a per-shift bound test.
+    ; This interior bucket contains at least two faces.
+    ; Thus the preceding bucket cannot contain all the model faces.
+    ; Use its last word for a zero sentinel. This removes the bounds test.
     clr.w   -2(a0)
 .packed_item:
     move.w  (a3),d5
@@ -4087,9 +4133,8 @@ sc_order_faces:
 .packed_shift:
     move.w  -2(a4),(a4)
     subq.l  #2,a4
-.packed_compare:
-    ; Admission emits ascending face IDs. Preserve the unsigned
-    ; packed ordering and stop without ever shifting an equal key.
+    ; Equal depths have ascending face IDs in the input.
+    ; Compare the packed words as unsigned values to keep this order.
     cmp.w   -2(a4),d5
     blo.s   .packed_shift
 .packed_insert:
@@ -4131,10 +4176,11 @@ sc_order_faces:
     lea     SC_BUCKET_CURSOR_BYTES(sp),a5
 .row:
     movea.l (a2)+,a4
-    move.l  a4,d4                ; next row's starting position
-    ; A row contributes at most SC_GRID_WIDTH-1 contiguous word IDs.
-    ; Its negative byte length is also the offset into these two-byte
-    ; moves. The backwards read preserves the row's exact painter order.
+    ; Save the start of the next row.
+    move.l  a4,d4
+    ; The row has at most SC_GRID_WIDTH-1 consecutive face IDs.
+    ; Use the negative byte count as the offset into the two-byte copies.
+    ; Copy the terrain IDs backward, then add this band's model IDs.
     move.l  a3,d0
     sub.l   a4,d0
     jmp     .object(pc,d0.w)
@@ -4163,9 +4209,11 @@ sc_order_faces:
 .empty:
     rts
 
-; Certify one side of a projected lateral rail. D7 is the seam Y,
-; A0 the seam's low X word. Parameters: corner offset, X direction,
-; first side (keep its signed dY) or second side (test monotonicity).
+; Check one side of a projected rail.
+; A0 points to the seam X word. D7 holds the seam Y value.
+; Argument 1 gives the corner offset. Argument 2 gives the X direction.
+; On the first side, argument 3 is 1. Keep the signed Y difference in D4.
+; On the second side, argument 3 is 0. Check the vertical direction.
     macro SLOPE_RAIL
     move.w  4+\1(a0),d3
     sub.w   d7,d3
@@ -4199,17 +4247,21 @@ sc_order_faces:
     endif
     endm
 
-; Playback owns its raster and buffer. No per-face callback selection.
-
+; Check one more corner against a rail that passed the first check.
+; A0 points to the original seam X word.
+; Argument 1 gives the offset to the far endpoint Y word.
+; Argument 2 gives the branch target if the check fails.
     macro TRIPLE_EXTEND_RAIL
-    move.w  -16(a0),d2           ; positive new horizontal gap
+    ; Calculate the X gap for the new corner.
+    move.w  -16(a0),d2
     sub.w   -8(a0),d2
     ble.w   \2
     move.w  -4(a0),d5
     move.w  -12(a0),d3
     sub.w   d5,d3
     beq.s   .rail_end\@
-    sub.w   \1(a0),d5            ; direction across the entire old rail
+    ; Use the two endpoints to find the direction of the old rail.
+    sub.w   \1(a0),d5
     beq.s   .same_dir\@
     eor.w   d3,d5
     bmi.w   \2
@@ -4226,6 +4278,13 @@ sc_order_faces:
 .rail_end\@:
     endm
 
+; ------------------------------------------------------------------------
+; Ordered drawing and terrain joins
+; ------------------------------------------------------------------------
+
+; The first stack argument is the scene. The second is the back page.
+; Draw the ordered faces. Poll input at the scheduled face slots.
+; This routine preserves D2-D7 and A2-A6.
 tb_scene_emit_draw:
     movem.l d2-d7/a2-a6,-(sp)
     movea.l 48(sp),a2
@@ -4234,15 +4293,16 @@ tb_scene_emit_draw:
     move.w  sc_draw_count(a2),d6
     beq.w   .done
     lea     sc_wedge_cache,a0
-    move.l  #$80008000,d0        ; outside the possible authored world
+    ; This cache key cannot occur at an authored world point.
+    move.l  #$80008000,d0
     rept    32
     move.l  d0,(a0)
     addq.l  #8,a0
     endr
-    ; D6 counts from the current slot to the next original input poll.
-    ; The first epoch can be short; every later one has 32 slots.
-    ; Keep the end pointer separately to distinguish an epoch boundary
-    ; from the final slot, even when a tree pair straddles a poll.
+    ; D6 counts the slots after the current slot and before the next poll.
+    ; The first group can be short. Each later group has 32 slots.
+    ; Keep the end pointer separate from the poll count.
+    ; A tree pair can cross a poll without changing the final slot.
     move.w  d6,d0
     add.w   d0,d0
     pea     (a3,d0.w)
@@ -4252,17 +4312,19 @@ tb_scene_emit_draw:
     move.w  (a3)+,d0
     cmpi.w  #SC_CLASS_TERRAIN_FACES,d0
     bhs.w   .model
-    move.w  d0,d7             ; retain actual painter ID alongside lattice node
+    ; Keep the face ID while D0 changes to the grid node.
+    move.w  d0,d7
     add.w   d0,d0
     lea     sc_strip(a2),a4
     adda.w  d0,a4
     lea     sc_strip_top(pc),a1
-    move.w  (a1,d0.w),d0        ; top-left from the fixed row/column
+    ; Read the top-left grid node for this face ID.
+    move.w  (a1,d0.w),d0
     cmpi.b  #4,(a4)
     bne.w   .diagonal
-    ; The sorter emits each terrain row in descending contiguous ID
-    ; order, then its models, then increasing terrain rows. ID-1
-    ; therefore certifies the same row when it is the next slot.
+    ; The sorter emits descending terrain IDs within each row.
+    ; The sorter then emits that band's model IDs and advances to the next row.
+    ; Thus the next slot can contain ID-1 only in the same terrain row.
     tst.w   d6
     beq.s   .ordinary_quad
     move.w  d7,d1
@@ -4279,39 +4341,38 @@ tb_scene_emit_draw:
 .ordinary_quad:
     bsr.w   tb_terrain_quad_scene
     beq.w   .rejected_quad
-    ; The private writer preserves the draw cursor, loop count and A6.
-    ; Rebind the scene only after an accepted quad.
+    ; The writer preserves the cursor, count, and A6.
+    ; Restore the scene pointer after an accepted quad.
     movea.l 52(sp),a2
     bra.w   .next
 .union:
     cmpi.w  #2,d2
     beq.s   .triple
     bhi.s   .four_run
-    ; The private proof disallowed a first-slot poll. The original
-    ; second-slot poll is retained by .next.
+    ; The join cannot cross a poll. Check the poll at the second slot.
     subq.w  #1,d6
     addq.l  #2,a3
     bsr.w   .outer_quad
     movea.l 52(sp),a2
     bra.w   .next
 .triple:
-    ; Neither skipped slot boundary owned an input poll. Keep the
-    ; third slot as the anchor for the original .next poll.
+    ; The join cannot cross either skipped slot's poll.
+    ; Check the poll at the third slot.
     subq.w  #2,d6
     addq.l  #4,a3
     bsr.w   tb_terrain_outer_eight
     movea.l 52(sp),a2
     bra.w   .next
 .four_run:
-    ; Probe ruled out polls at all three skipped slot boundaries.
+    ; The join cannot cross any of the three skipped slots' polls.
     subq.w  #3,d6
     addq.l  #6,a3
     bsr.w   tb_long_4
     movea.l 52(sp),a2
     bra.w   .next
 .rejected_quad:
-    ; A4 is the untouched strip record on rejection. Rebuild its
-    ; original lattice index only for the general face fallback.
+    ; A4 still points to the strip record.
+    ; Get the grid node again to make the fallback face record.
     move.w  d0,d7
     lea     sc_strip(a2),a1
     move.l  a4,d0
@@ -4319,7 +4380,7 @@ tb_scene_emit_draw:
     lea     sc_strip_top(pc),a1
     move.w  (a1,d0.w),d0
     bsr.s   .face_record
-    ; Keep the same fallback record even for an empty sample interval.
+    ; Keep the fallback face record even when it covers no scanlines.
     tst.w   d7
     bmi.s   .next
     bsr.w   sc_emit_face
@@ -4334,8 +4395,8 @@ tb_scene_emit_draw:
     lsl.w   #2,d0
     lea     sc_faces(a2),a4
     adda.w  d0,a4
-    ; Trees append two consecutive source faces. Only merge when the
-    ; actual painter encounters the pair consecutively in original order.
+    ; Each tree has two consecutive source faces.
+    ; Join them only when they occupy consecutive slots in the original order.
     move.b  d7,d0
     sub.b   sc_tree_first_face(a2),d0
     blo.s   .ordinary_model
@@ -4352,11 +4413,12 @@ tb_scene_emit_draw:
     tst.b   d0
     beq.s   .ordinary_model
     addq.l  #2,a3
-    ; Keep the existing poll count when the first skipped slot owns it.
+    ; Poll here if the first slot has a scheduled poll.
     tst.w   d6
     bne.s   .tree_second_slot
     bsr.w   play_poll_input
-    moveq   #32,d6            ; second slot is first in the next epoch
+    ; The second slot starts the next group.
+    moveq   #32,d6
 .tree_second_slot:
     subq.w  #1,d6
     bra.s   .next
@@ -4367,7 +4429,7 @@ tb_scene_emit_draw:
     bsr.w   sc_emit_face
 .next:
     dbra    d6,.face
-    ; The keyboard needs a handshake sooner than one software frame.
+    ; Poll during drawing so the keyboard can complete its handshake.
     bsr.w   play_poll_input
     cmpa.l  (sp),a3
     beq.s   .end_slots
@@ -4379,8 +4441,9 @@ tb_scene_emit_draw:
     movem.l (sp)+,d2-d7/a2-a6
     rts
 
-; Material/kind and top-left identify the original cyclic vertices.
-; Construct a regular record only for the generic boundary interfaces.
+; D0 gives the top-left node. A4 points to the two-byte strip record.
+; Write TL, BL, BR, TR and copy the kind and ink into the fallback record.
+; Return the address of the record in A4.
 .face_record:
     move.w  (a4),d1
     lea     sc_strip_fallback(a2),a4
@@ -4394,10 +4457,11 @@ tb_scene_emit_draw:
     move.w  d1,8(a4)
     rts
 
-; D0 = current face's top-left node, D6 = number of remaining slots.
-; Require six inside projected corners, same solid ink, adjacent slots
-; in the same lattice row, and no input poll between the two faces.
-; D0/A2/A3/A4/A6/D6 survive the failed proof.
+; D0 gives the top-left grid node. D6 holds the poll count.
+; The caller checks the first pair for adjacent slots and equal solid inks.
+; Check that all six projected corners are inside the viewport.
+; The result in D2 is the number of extra tiles. Zero rejects the join.
+; On rejection, preserve D0, D6, A2, A3, A4, and A6.
 .slope_admit:
     lea     sc_outcode(a2),a0
     adda.w  d0,a0
@@ -4414,8 +4478,8 @@ tb_scene_emit_draw:
     lsl.w   #3,d2
     lea     sc_projected+2(a2),a0
     adda.w  d2,a0
-    ; Both outside columns must run the same way vertically as the
-    ; middle one. Monotone rails can overlap in height.
+    ; All three columns must change Y in the same direction.
+    ; The rails can overlap in Y.
     move.w  4(a0),d7
     move.w  4+SC_GRID_WIDTH*8(a0),d3
     move.w  d3,d1
@@ -4454,9 +4518,9 @@ tb_scene_emit_draw:
     cmp.w   d1,d2
     bhi.w   .slope_no
 
-    ; |seam dX/dY| <= 2. A lateral horizontal gap >=3*|dY| keeps
-    ; at least one Q4 unit of separation from it per raw Y unit.
-    ; That exceeds the combined error of the two existing Q16 edges.
+    ; The seam has an absolute slope of at most two X units per Y unit.
+    ; The X gap must be at least three times the absolute Y difference.
+    ; The resulting separation exceeds the combined error of the two Q16 edges.
     SLOPE_RAIL    -8,1,1
     SLOPE_RAIL     8,-1,0
     lea     SC_GRID_WIDTH*8(a0),a0
@@ -4464,12 +4528,11 @@ tb_scene_emit_draw:
     SLOPE_RAIL    -8,1,1
     SLOPE_RAIL     8,-1,0
 
-; The accepted first proof left A0 at its lower seam and D0 as its
-; terrain node. Reuse the certified left/middle/right columns.
+; A0 points to the lower seam. D0 still holds the top-left grid node.
+; Keep the three columns that passed the pair check.
 .extend_first:
-    ; The first join already excludes a poll at the first slot and
-    ; proves one following slot. A poll at the second, or no third
-    ; slot, precludes extension.
+    ; Do not extend the pair if the second slot has a poll.
+    ; Also require the next slot to contain the adjacent terrain ID.
     cmpi.w  #1,d6
     beq.w   .keep_pair
     move.w  (a3),d1
@@ -4486,8 +4549,8 @@ tb_scene_emit_draw:
     andi.b  #$21,d1
     bne.w   .keep_pair
 
-    ; The first pair's left column is the new seam. Its vertical
-    ; direction was proved already; the new outer column must match.
+    ; The left column of the pair is the new seam.
+    ; The new outside column must have the same vertical direction.
     move.w  -4(a0),d7
     move.w  -4-SC_GRID_WIDTH*8(a0),d3
     move.w  -12(a0),d5
@@ -4501,7 +4564,8 @@ tb_scene_emit_draw:
     bpl.s   .positive_height
     neg.w   d1
 .positive_height:
-    cmpi.w  #16,d1             ; any full Q4 row guarantees a sample
+    ; A difference of 16 Q4 units or more always gives a sample.
+    cmpi.w  #16,d1
     bhs.s   .nonempty_seam
     addq.w  #7,d3
     addq.w  #7,d7
@@ -4519,15 +4583,14 @@ tb_scene_emit_draw:
     cmp.w   d1,d2
     bhi.w   .keep_pair
 
-    ; The old left lateral is already proved. Check only the new
-    ; side and use the previous full three-node rail's direction.
-    ; An equal-Y step inside the old rail must not hide a reversal.
+    ; Check only the new side against the direction of the full old rail.
+    ; Equal Y values at an inner step do not permit a reversal.
     TRIPLE_EXTEND_RAIL 12,.keep_pair
     lea     -SC_GRID_WIDTH*8(a0),a0
     TRIPLE_EXTEND_RAIL 12,.keep_pair
 
-    ; A0 is still the original top seam. Preserve it across the
-    ; second extension so a miss can draw the approved triple.
+    ; Save the original top seam in A5.
+    ; Use it for the three-tile outline if the last check fails.
 .extend_four:
     movea.l a0,a5
     cmpi.w  #2,d6
@@ -4546,8 +4609,8 @@ tb_scene_emit_draw:
     andi.b  #$21,d1
     bne.w   .keep_three
 
-    ; Shift the coordinate origin by one grid node. The previously
-    ; approved leftmost column is the seam; check only its new neighbour.
+    ; Move one node left. This column becomes the seam.
+    ; Check only the new adjacent column.
     lea     -8(a0),a0
     move.w  -4(a0),d3
     move.w  -4+SC_GRID_WIDTH*8(a0),d7
@@ -4582,7 +4645,8 @@ tb_scene_emit_draw:
     TRIPLE_EXTEND_RAIL 20,.keep_three
     lea     SC_GRID_WIDTH*8(a0),a0
     TRIPLE_EXTEND_RAIL 20,.keep_three
-    lea     -24(a5),a0          ; new top left of the direct-grid outline
+    ; A0 points to the top-left point of the four-tile outline.
+    lea     -24(a5),a0
     moveq   #3,d2
     rts
 .keep_three:
@@ -4598,13 +4662,14 @@ tb_scene_emit_draw:
     rts
 
 .outer_quad:
-    ; The accepted pair starts one lattice column before D0. The
-    ; private six-point cursor reads the original projected X/Y words.
+    ; The pair starts one column before the grid node in D0.
+    ; The writer reads the six projected X and Y pairs directly.
     lsl.w   #3,d0
     lea     sc_projected+2-8(a2),a0
     adda.w  d0,a0
     bra.w   tb_terrain_outer_six
 
+; Convert a terrain face ID to its top-left grid node.
 sc_strip_top:
 strip_node set 0
     rept SC_GRID_DEPTH-1
@@ -4615,16 +4680,19 @@ strip_node set strip_node+1
 strip_node set strip_node+1
     endr
 
-; Within one level grid row, Z is constant. Generate screen X from the
-; first numerator and one cell-size numerator. Each following column
-; subtracts (step quotient, step remainder) with one carry correction.
-; Preserve signed DIVS rounding where X crosses zero and restart at each
-; partial edge interval; regular lattice intervals use the recurrence.
-; Rows behind the near plane are unused.
-; Typed strip axes have at most a low partial gap, one contiguous full
-; lattice run, and at most a high partial gap before the repeated endpoint.
-; Keep points at actual discontinuities on DIVS; no gap test or source-axis
-; cursor is required inside the lattice run.
+; ------------------------------------------------------------------------
+; Exact X projection for terrain grid rows
+; ------------------------------------------------------------------------
+
+; The grid row has one camera depth. Start with the first quotient and remainder.
+; For each full tile, subtract the X-step quotient and remainder.
+; If the remainder becomes negative, add the depth and decrement the quotient.
+; Use separate runs for nonnegative and negative numerators to match DIVS.
+
+; The X axis can have a partial tile at each end and repeat its last point.
+; Use DIVS at each partial endpoint. Copy the last point into the padding.
+; If two consecutive rows have the same depth, copy the first row's X values.
+; Skip rows with a camera depth below SC_NEAR.
 SC_X_PREVIOUS equ 0
 SC_X_POSITIVE equ 2
 SC_X_PADDING  equ 4
@@ -4634,7 +4702,7 @@ SC_X_HIGH_NUM equ 12
 SC_X_NEGATIVE equ 16
 SC_X_BYTES    equ 18
 
-; D6.w camera X and world X at operand -> signed DIVS numerator.
+; Use camera X in D6.W and the world X operand to calculate the numerator in D0.L.
     macro SC_X_NUMERATOR
     move.w  d6,d0
     sub.w   \1,d0
@@ -4642,7 +4710,7 @@ SC_X_BYTES    equ 18
     clr.w   d0
     endm
 
-; Signed CPU quotient/remainder -> floor quotient with nonnegative remainder.
+; Divide D0.L by D2.W. Return the floor quotient in D1.W and the remainder in D0.W.
     macro SC_X_ANCHOR
     divs.w  d2,d0
     move.w  d0,d1
@@ -4654,6 +4722,8 @@ SC_X_BYTES    equ 18
 .floor\@:
     endm
 
+; Add the screen center to the quotient in D6.W.
+; Store the X value as a signed longword and advance A6.
     macro SC_X_SCREEN
     addi.w  #SC_CX,d6
     ext.l   d6
@@ -4661,9 +4731,9 @@ SC_X_BYTES    equ 18
     addq.l  #8,a6
     endm
 
-; A floor pair is a DIVS pair for nonnegative numerators. A ceiling
-; pair is a DIVS pair for negative numerators. In the second rail retain
-; ceiling remainder + D - 1, so both loops use the same carry correction.
+; The floor quotient matches DIVS for nonnegative numerators.
+; The ceiling quotient matches DIVS for negative numerators.
+; Keep ceiling remainder + D2 - 1 so both runs use the same correction.
     macro SC_X_COMPLEMENT
     tst.w   d0
     beq.s   .exact\@
@@ -4683,7 +4753,7 @@ SC_X_BYTES    equ 18
     subq.w  #1,d1
     endm
 
-; D1 includes the horizontal origin, applied only at the row seed.
+; Store the signed X value in D1.W and advance A6. The value includes the screen center.
     macro SC_X_RAIL_STORE
     move.w  d1,d6
     ext.l   d6
@@ -4691,24 +4761,28 @@ SC_X_BYTES    equ 18
     addq.l  #8,a6
     endm
 
-; Only the rail uses a floor pair. An isolated partial endpoint can
-; store the CPU's signed truncated quotient without a round trip.
+; For a partial endpoint, use the signed DIVS quotient directly.
+; Do not convert the quotient and remainder to the form for the full tiles.
     macro SC_X_PARTIAL
     divs.w  d2,d0
     move.w  d0,d6
     SC_X_SCREEN
     endm
 
+; A2 points to the scene. Write the Q4 X longword of each projected grid point.
+; This routine preserves A2, A4, and A5. It can change D0-D7, A0-A1, A3, and A6.
 sc_project_grid_x:
     movem.l a4-a5,-(sp)
     lea     -SC_X_BYTES(sp),sp
     clr.w   SC_X_PREVIOUS(sp)
-    moveq   #0,d3               ; bit 0: low partial; bit 1: high partial
+    ; Bits 0 and 1 mark the low and high partial tiles.
+    moveq   #0,d3
     move.w  sc_camx(a2),d6
     lea     sc_grid_x(a2),a0
     move.w  2(a0),d0
     sub.w   (a0),d0
-    beq.s   .low_ready          ; entire axis is a repeated endpoint
+    ; A zero first gap identifies an axis with one repeated point.
+    beq.s   .low_ready
     cmpi.w  #SC_TILE_SIZE,d0
     beq.s   .low_ready
     SC_X_NUMERATOR (a0)
@@ -4717,7 +4791,8 @@ sc_project_grid_x:
     moveq   #1,d3
 .low_ready:
     SC_X_NUMERATOR (a0)
-    movea.l d0,a4               ; seed numerator is invariant across rows
+    ; Keep the same numerator for the first full-tile point in each row.
+    movea.l d0,a4
     lea     sc_grid_x+SC_GRID_X_END(a2),a1
     move.w  (a1),d1
     moveq   #0,d5
@@ -4743,8 +4818,8 @@ sc_project_grid_x:
     move.l  a1,d0
     sub.l   a0,d0
     lsr.w   #1,d0
-    ; The regular world-X rail increments by 16. Classify the
-    ; sign boundary once for the frame, not once per projected point.
+    ; Each full tile adds 16 world units to X.
+    ; Calculate the sign boundary once for all rows.
     move.w  d6,d1
     sub.w   (a0),d1
     asr.w   #SC_TILE_SHIFT,d1
@@ -4800,8 +4875,8 @@ sc_project_grid_x:
     dbra    d5,.positive_step
     move.w  SC_X_NEGATIVE(sp),d5
     bmi.s   .rail_done
-    ; Convert at the last nonnegative point, then step into the
-    ; negative half. Conversion also maps a zero remainder exactly.
+    ; Convert at the last nonnegative point before the first negative step.
+    ; Apply the exact correction when the remainder is zero.
     SC_X_COMPLEMENT
 .negative_step:
     SC_X_RAIL_STEP .negative_out
@@ -4844,9 +4919,14 @@ sc_project_grid_x:
     movem.l (sp)+,a4-a5
     rts
 
-; A4 face, A6 context. A3/A4/A5/A6 and all D2-D7 saved.
-; Clip once per edge only when needed; the ordinary path copies already
-; projected points. The scratch polygon is naturally aligned on the stack.
+; ------------------------------------------------------------------------
+; Fallback polygon projection and clipping
+; ------------------------------------------------------------------------
+
+; A2 points to the scene. A4 points to a face. A6 points to the back page.
+; Copy the projected points if all vertices are on or in front of the near plane.
+; Otherwise, clip the edges and store their projected points on the stack.
+; This routine preserves D2-D7 and A2-A6.
 sc_emit_face:
     movem.l d2-d7/a3-a4,-(sp)
     lea     -24(sp),sp
@@ -4857,7 +4937,8 @@ sc_emit_face:
     subq.w  #1,d6
     move.w  d6,d0
     add.w   d0,d0
-    move.w  (a4,d0.w),d5       ; previous vertex, closing the polygon
+    ; Start with the last point to include the closing edge.
+    move.w  (a4,d0.w),d5
     lea     sc_outcode(a2),a0
     movem.w (a4),d0-d3
     move.b  (a0,d0.w),d4
@@ -4877,18 +4958,21 @@ sc_emit_face:
     bra     .paint
 
 .near_clip:
-    moveq   #0,d7               ; output count
+    ; Start the output point count at zero.
+    moveq   #0,d7
 .edge:
-    move.w  (a4)+,d4            ; current vertex
+    move.w  (a4)+,d4
     lea     sc_camera_vertices(a2),a0
     move.w  d5,d0
     SC_TIMES3_W d0,d1
     add.w   d0,d0
-    lea     (a0,d0.w),a1        ; previous
+    ; A1 points to the previous camera vertex.
+    lea     (a0,d0.w),a1
     move.w  d4,d0
     SC_TIMES3_W d0,d1
     add.w   d0,d0
-    lea     (a0,d0.w),a0        ; current
+    ; A0 points to the current camera vertex.
+    lea     (a0,d0.w),a0
     move.w  4(a1),d2
     move.w  4(a0),d5
     move.w  d2,d0
@@ -4900,17 +4984,19 @@ sc_emit_face:
     cmp.b   d1,d0
     beq.s   .maybe_current
 
-    ; Canonical attachment on the low-Z end makes adjacent-face clipping
-    ; independent of winding, including signed division's rounding.
+    ; Start interpolation at the endpoint with the smaller Z.
+    ; This gives both faces on the edge the same signed division result.
     move.w  d5,-(sp)
     cmp.w   d5,d2
     ble.s   .calculate_edge
     exg     a0,a1
     exg     d2,d5
 .calculate_edge:
-    sub.w   d2,d5               ; edge dZ
+    ; D5 holds the positive Z difference along the edge.
+    sub.w   d2,d5
     move.w  #SC_NEAR,d1
-    sub.w   d2,d1               ; clip plane distance from low end
+    ; D1 holds the Z distance from the lower endpoint to the near plane.
+    sub.w   d2,d1
     move.w  (a0),d0
     sub.w   (a1),d0
     muls.w  d1,d0
@@ -4924,7 +5010,8 @@ sc_emit_face:
     move.w  d2,d1
     move.w  #SC_NEAR,d2
     move.l  sc_draw_mode(a2),d3
-    movea.l 54(sp),a0           ; saved face base, below the saved endpoint
+    ; Read the face base from the save area below the saved endpoint.
+    movea.l 54(sp),a0
     cmpi.w  #SC_GRID_POINTS,(a0)
     bhs.s   .clip_project
     moveq   #0,d3
@@ -4946,8 +5033,8 @@ sc_emit_face:
 .advance:
     move.w  d4,d5
     dbra    d6,.edge
-    ; A4 walked by one word per source point. Color remains 9 bytes after
-    ; the face base; restore that base from the outer frame's MOVEM save.
+    ; A4 advanced over the source points.
+    ; Restore the face base to read its ink at offset 9.
     movea.l 52(sp),a4
 .paint:
     cmpi.w  #3,d7
@@ -4959,20 +5046,20 @@ sc_emit_face:
     bset    #8,d0
 .solid:
     movea.l sp,a0
-    ; Private polygon ABI: A0=points, D7=count, D0=color, A6=surface.
-    ; Callback preserves A2/A5/A6; this frame restores D2-D7/A3-A4.
+    ; A0 points to the Q4 points. D7.W gives the count.
+    ; D0 gives the ink code. A6 points to the back page.
+    ; The span writer preserves A2, A5, and A6.
     bsr.w   tb_span_poly_scene
 .done:
     lea     24(sp),sp
     movem.l (sp)+,d2-d7/a3-a4
     rts
 
-; Boundary tile: intersect its world rectangle with the authored-camera
-; foreground line, then project the 3..5 actual surviving points. Original
-; corners use their exact existing quotient; intersection height is sampled
-; at its true world (X,Z), not inherited from the clipped-away corner.
-; A4 face, A6 target. Preserve outer painter registers.
-; Flattened top-left node ID -> even byte offset within each axis.
+; ------------------------------------------------------------------------
+; Terrain tiles on the foreground boundary
+; ------------------------------------------------------------------------
+
+; Convert a top-left grid node to the even byte offsets in the X and Z axes.
 sc_wedge_axes:
 .wr set 0
     rept SC_GRID_DEPTH
@@ -5005,47 +5092,53 @@ sc_wedge_side macro
     sub.w   sc_front_dx(a2),d3
     endm
 
-; Visit the next source corner, with 0 for constant Z or 1 for constant X.
+; Visit one corner. Argument 1 is 0 for constant Z or 1 for constant X.
 sc_wedge_corner macro
-    ; Kind 5 is admitted only with side(TL)<0 and side(BR)>0.
-    ; A corner already on the clipping line is kept without an intersection.
+    ; Kind 5 has its top-left corner inside the boundary.
+    ; Its bottom-right corner is outside the boundary.
+    ; Keep a corner on the boundary without adding an intersection.
     ifeq \3-2
-    addq.l  #2,a4               ; outside BR never needs its projected index
+    ; Skip the projected index for the outside bottom-right corner.
+    addq.l  #2,a4
     else
     move.w  (a4)+,d6
     endif
     ifeq \3
-    tst.w   d4                  ; retained TL needs coordinates only on a crossing
+    ; Read the inside top-left coordinates only for an intersection.
+    tst.w   d4
     ble.s   .keep\@
     sc_wedge_side \2
     endif
     ifeq \3-1
-    sc_wedge_side \2            ; BL is the one side consumed by the next visit
+    ; Keep the signed side for use at the bottom-right corner.
+    sc_wedge_side \2
     tst.w   d3
     ble.s   .keep\@
     endif
     ifeq \3-2
-    tst.w   d5                  ; outside BR needs coordinates only on a crossing
+    ; Read the outside bottom-right coordinates only for an intersection.
+    tst.w   d5
     bge.s   .next\@
     sc_wedge_side \2
     endif
     ifeq \3-3
-    move.w  d4,d3               ; exact saved TR side also sets sign and zero
+    ; Reuse the signed side of the top-right corner.
+    move.w  d4,d3
     bgt.s   .next\@
     beq.s   .keep\@
     sc_wedge_xz \2
     endif
-    ; Cyclic rectangle: top-right to top-left and bottom-left to
-    ; bottom-right have constant Z; the other two have constant X.
+    ; The top and bottom edges have constant Z.
+    ; The left and right edges have constant X.
     ifne \1
     move.w  d3,d1
     asr.w   #1,d1
-    sub.w   d1,d2               ; Constant X; adjust Z.
+    sub.w   d1,d2
     else
-    sub.w   d3,d0               ; Constant Z; adjust X.
+    sub.w   d3,d0
     endif
-    ; A world Z identifies a horizontal cut, and X a vertical cut.
-    ; Hash in coarse map cells and check the complete (X,Z) key.
+    ; Select the cache entry by the fixed edge coordinate and coarse cell.
+    ; Compare both X and Z before use.
     ifne \1
     move.w  d0,d1
     else
@@ -5072,7 +5165,8 @@ sc_wedge_corner macro
     move.l  -4(a3),4(a0)
 .no_intersection\@:
     ifeq \3-1
-    bra.s   .next\@             ; this crossing reaches outside BL
+    ; The bottom-left corner is outside. Keep only the intersection.
+    bra.s   .next\@
     endif
     ifne \3-2
 .keep\@:
@@ -5089,13 +5183,18 @@ sc_wedge_corner macro
     endif
     endm
 
+; A2 points to the scene. A4 points to a boundary face. A6 is the back page.
+; Intersect the tile with the foreground line. Emit the three to five points.
+; Use the existing projections for the original corners.
+; Sample each intersection height at its world X and Z.
+; This routine preserves D2-D7 and A2-A6.
 sc_emit_wedge_face:
     movem.l d2-d7/a3-a4,-(sp)
     lea     -28(sp),sp
     movea.l sp,a3
     moveq   #0,d7
-    ; The boundary emitter's face record is TL, BL, BR, TR on the
-    ; regular grid. All corner offsets are relative to the original TL.
+    ; The face record gives TL, BL, BR, TR in order.
+    ; Each corner offset is relative to TL.
     move.w  (a4),d3
     add.w   d3,d3
     lea     sc_wedge_axes(pc),a1
@@ -5105,15 +5204,18 @@ sc_emit_wedge_face:
     addq.w  #1,d3
     move.b  (a1,d3.w),d2
     lea     sc_grid_x(a2),a1
-    move.l  (a1,d0.w),20(sp)     ; left/right axis values
+    ; Save the two X coordinates.
+    move.l  (a1,d0.w),20(sp)
     lea     sc_grid_z(a2),a1
-    move.l  (a1,d2.w),24(sp)     ; top/bottom axis values
-    sc_wedge_side 6              ; seed the signed side of TR
-    move.w  d3,d4               ; signed TR side stays live across the cut
-    sc_wedge_corner 0,0,0        ; TR to TL, fixed Z
-    sc_wedge_corner 1,6*SC_GRID_WIDTH,1 ; TL to BL, fixed X
-    sc_wedge_corner 0,6*SC_GRID_WIDTH+6,2 ; BL to BR, fixed Z
-    sc_wedge_corner 1,6,3        ; BR to TR, fixed X
+    ; Save the two Z coordinates.
+    move.l  (a1,d2.w),24(sp)
+    ; Calculate the signed distance for the top-right corner first.
+    sc_wedge_side 6
+    move.w  d3,d4
+    sc_wedge_corner 0,0,0
+    sc_wedge_corner 1,6*SC_GRID_WIDTH,1
+    sc_wedge_corner 0,6*SC_GRID_WIDTH+6,2
+    sc_wedge_corner 1,6,3
     cmpi.w  #3,d7
     blo.s   .done
     moveq   #0,d0
@@ -5129,6 +5231,8 @@ sc_emit_wedge_face:
     movem.l (sp)+,d2-d7/a3-a4
     rts
 
+; D0 and D2 give world X and Z. Append the projected Q4 pair at A3.
+; Advance A3 and increment the point count in D7.
 .project_world:
     bsr.w   sc_ground_height
     neg.w   d2
@@ -5136,17 +5240,20 @@ sc_emit_wedge_face:
     lsl.w   #4,d2
     neg.w   d0
     add.w   sc_camx(a2),d0
-    ; Intersections stay within their integer world-edge endpoints,
-    ; including rounded odd thresholds. Depth is still 96..304 and
-    ; both ground heights are 0..21: reuse the exact elevation slot.
-    swap    d0                 ; signed world X displacement * $10000
+    ; Integer rounding keeps the intersection within its edge endpoints.
+    ; Depth stays within 96 to 304 units. Terrain height stays within 0 to 21.
+    ; Use the terrain elevation table for the intersection.
+    ; Scale the signed world X difference by 65536.
+    swap    d0
     clr.w   d0
-    divs.w  d2,d0              ; keep the signed quotient for X
+    divs.w  d2,d0
     addi.w  #SC_CX,d0
     sub.w   sc_camy(a2),d1
     neg.w   d1
-    lsl.w   #6,d1              ; exact height below the eye in Q6
-    lsr.w   #1,d2              ; depth Q4 -> eight-byte slot offset
+    ; Convert the height below the eye to Q6.
+    lsl.w   #6,d1
+    ; Convert the Q4 depth to an eight-byte table offset.
+    lsr.w   #1,d2
     lea     sc_elevation_magic-8*SC_FOOT_NEAR,a1
     mulu.w  (a1,d2.w),d1
     add.l   4(a1,d2.w),d1
@@ -5165,441 +5272,438 @@ sc_grove_ground: ds.w SC_GROVE_COUNT
     ifgt SC_NEAR-16*SC_FOOT_NEAR
     fail "Typed strip requires every terrain vertex beyond the near plane"
     endif
-    ifne SC_TILE_SIZE-16
-    fail "Regenerate the X step coefficients for the new terrain tile size"
-    endif
     ifne (SC_FOCUS_Q4-4096)|(SC_CAMERA_ORIGIN_Y-1216)|(SC_EYE_HEIGHT-44)|(SC_GROUND_MAX-21)|(SC_FOOT_NEAR-96)|(SC_FOOT_FAR-304)
     fail "Regenerate exact elevation coefficients for updated camera bounds"
     endif
     section elevation_magic,data
 
 ; ------------------------------------------------------------------------
-; Exact reciprocal constants for terrain elevation
+; Exact terrain projection table
 ; ------------------------------------------------------------------------
 
-; Generated by tools/make_elevation_magic.py. Each slot is one Z depth.
-; Q4 screen Y = (height_below_eye_q6 * slope + bias) >> 16.
-; The unused word stores the Q4 remainder for the regular X step.
+; tools/make_elevation_magic.py generates one eight-byte record per depth.
+; The first word is the Y slope. Its upper ten bits also give the X-step quotient.
+; The second word is the remainder for the X step. The longword is the Y bias.
+; Calculate screen Y in Q4 as (height_below_eye_q6 * slope + bias) >> 16.
 sc_elevation_magic:
     dc.w 43690,1024
-    dc.l 79704512  ; Z=96
+    dc.l 79704512  ; Z = 96
     dc.w 43240,976
-    dc.l 79692480  ; Z=97
+    dc.l 79692480  ; Z = 97
     dc.w 42799,1152
-    dc.l 79692480  ; Z=98
+    dc.l 79692480  ; Z = 98
     dc.w 42366,1552
-    dc.l 79692928  ; Z=99
+    dc.l 79692928  ; Z = 99
     dc.w 41943,576
-    dc.l 79693120  ; Z=100
+    dc.l 79693120  ; Z = 100
     dc.w 41527,1408
-    dc.l 79693632  ; Z=101
+    dc.l 79693632  ; Z = 101
     dc.w 41120,832
-    dc.l 79694784  ; Z=102
+    dc.l 79694784  ; Z = 102
     dc.w 40721,448
-    dc.l 79693056  ; Z=103
+    dc.l 79693056  ; Z = 103
     dc.w 40329,256
-    dc.l 79696832  ; Z=104
+    dc.l 79696832  ; Z = 104
     dc.w 39945,256
-    dc.l 79699136  ; Z=105
+    dc.l 79699136  ; Z = 105
     dc.w 39568,448
-    dc.l 79695296  ; Z=106
+    dc.l 79695296  ; Z = 106
     dc.w 39199,832
-    dc.l 79692288  ; Z=107
+    dc.l 79692288  ; Z = 107
     dc.w 38836,1408
-    dc.l 79693376  ; Z=108
+    dc.l 79693376  ; Z = 108
     dc.w 38479,432
-    dc.l 79694720  ; Z=109
+    dc.l 79694720  ; Z = 109
     dc.w 38130,1376
-    dc.l 79692416  ; Z=110
+    dc.l 79692416  ; Z = 110
     dc.w 37786,736
-    dc.l 79693824  ; Z=111
+    dc.l 79693824  ; Z = 111
     dc.w 37449,256
-    dc.l 79696832  ; Z=112
+    dc.l 79696832  ; Z = 112
     dc.w 37117,1744
-    dc.l 79692096  ; Z=113
+    dc.l 79692096  ; Z = 113
     dc.w 36792,1600
-    dc.l 79692736  ; Z=114
+    dc.l 79692736  ; Z = 114
     dc.w 36472,1616
-    dc.l 79691968  ; Z=115
+    dc.l 79691968  ; Z = 115
     dc.w 36157,1792
-    dc.l 79695488  ; Z=116
+    dc.l 79695488  ; Z = 116
     dc.w 35848,256
-    dc.l 79701952  ; Z=117
+    dc.l 79701952  ; Z = 117
     dc.w 35544,736
-    dc.l 79696576  ; Z=118
+    dc.l 79696576  ; Z = 118
     dc.w 35246,1376
-    dc.l 79693248  ; Z=119
+    dc.l 79693248  ; Z = 119
     dc.w 34952,256
-    dc.l 79695552  ; Z=120
+    dc.l 79695552  ; Z = 120
     dc.w 34663,1200
-    dc.l 79693568  ; Z=121
+    dc.l 79693568  ; Z = 121
     dc.w 34379,352
-    dc.l 79694272  ; Z=122
+    dc.l 79694272  ; Z = 122
     dc.w 34100,1600
-    dc.l 79692608  ; Z=123
+    dc.l 79692608  ; Z = 123
     dc.w 33825,1024
-    dc.l 79692864  ; Z=124
+    dc.l 79692864  ; Z = 124
     dc.w 33554,576
-    dc.l 79693632  ; Z=125
+    dc.l 79693632  ; Z = 125
     dc.w 33288,256
-    dc.l 79692736  ; Z=126
+    dc.l 79692736  ; Z = 126
     dc.w 33026,64
-    dc.l 79694336  ; Z=127
+    dc.l 79694336  ; Z = 127
     dc.w 32768,0
-    dc.l 79724480  ; Z=128
+    dc.l 79724480  ; Z = 128
     dc.w 32513,64
-    dc.l 79697088  ; Z=129
+    dc.l 79697088  ; Z = 129
     dc.w 32263,256
-    dc.l 79695808  ; Z=130
+    dc.l 79695808  ; Z = 130
     dc.w 32017,576
-    dc.l 79694080  ; Z=131
+    dc.l 79694080  ; Z = 131
     dc.w 31775,1024
-    dc.l 79692800  ; Z=132
+    dc.l 79692800  ; Z = 132
     dc.w 31536,1600
-    dc.l 79694272  ; Z=133
+    dc.l 79694272  ; Z = 133
     dc.w 31300,160
-    dc.l 79693632  ; Z=134
+    dc.l 79693632  ; Z = 134
     dc.w 31068,976
-    dc.l 79694144  ; Z=135
+    dc.l 79694144  ; Z = 135
     dc.w 30840,1920
-    dc.l 79694784  ; Z=136
+    dc.l 79694784  ; Z = 136
     dc.w 30615,800
-    dc.l 79692480  ; Z=137
+    dc.l 79692480  ; Z = 137
     dc.w 30393,1984
-    dc.l 79693696  ; Z=138
+    dc.l 79693696  ; Z = 138
     dc.w 30174,1072
-    dc.l 79693504  ; Z=139
+    dc.l 79693504  ; Z = 139
     dc.w 29959,256
-    dc.l 79693312  ; Z=140
+    dc.l 79693312  ; Z = 140
     dc.w 29746,1792
-    dc.l 79693952  ; Z=141
+    dc.l 79693952  ; Z = 141
     dc.w 29537,1184
-    dc.l 79693120  ; Z=142
+    dc.l 79693120  ; Z = 142
     dc.w 29330,672
-    dc.l 79694848  ; Z=143
+    dc.l 79694848  ; Z = 143
     dc.w 29127,256
-    dc.l 79695680  ; Z=144
+    dc.l 79695680  ; Z = 144
     dc.w 28926,2256
-    dc.l 79689216  ; Z=145
+    dc.l 79689216  ; Z = 145
     dc.w 28728,2048
-    dc.l 79692480  ; Z=146
+    dc.l 79692480  ; Z = 146
     dc.w 28532,1936
-    dc.l 79694144  ; Z=147
+    dc.l 79694144  ; Z = 147
     dc.w 28339,1920
-    dc.l 79694656  ; Z=148
+    dc.l 79694656  ; Z = 148
     dc.w 28149,2000
-    dc.l 79694144  ; Z=149
+    dc.l 79694144  ; Z = 149
     dc.w 27962,2176
-    dc.l 79692224  ; Z=150
+    dc.l 79692224  ; Z = 150
     dc.w 27776,32
-    dc.l 79695808  ; Z=151
+    dc.l 79695808  ; Z = 151
     dc.w 27594,384
-    dc.l 79693760  ; Z=152
+    dc.l 79693760  ; Z = 152
     dc.w 27413,832
-    dc.l 79693312  ; Z=153
+    dc.l 79693312  ; Z = 153
     dc.w 27235,1376
-    dc.l 79694656  ; Z=154
+    dc.l 79694656  ; Z = 154
     dc.w 27060,2016
-    dc.l 79691584  ; Z=155
+    dc.l 79691584  ; Z = 155
     dc.w 26886,256
-    dc.l 79693888  ; Z=156
+    dc.l 79693888  ; Z = 156
     dc.w 26715,1072
-    dc.l 79692544  ; Z=157
+    dc.l 79692544  ; Z = 157
     dc.w 26546,1984
-    dc.l 79692288  ; Z=158
+    dc.l 79692288  ; Z = 158
     dc.w 26379,448
-    dc.l 79693504  ; Z=159
+    dc.l 79693504  ; Z = 159
     dc.w 26214,1536
-    dc.l 79699392  ; Z=160
+    dc.l 79699392  ; Z = 160
     dc.w 26051,144
-    dc.l 79693056  ; Z=161
+    dc.l 79693056  ; Z = 161
     dc.w 25890,1408
-    dc.l 79694272  ; Z=162
+    dc.l 79694272  ; Z = 162
     dc.w 25731,160
-    dc.l 79693184  ; Z=163
+    dc.l 79693184  ; Z = 163
     dc.w 25575,1600
-    dc.l 79692608  ; Z=164
+    dc.l 79692608  ; Z = 164
     dc.w 25420,496
-    dc.l 79691584  ; Z=165
+    dc.l 79691584  ; Z = 165
     dc.w 25266,2112
-    dc.l 79694080  ; Z=166
+    dc.l 79694080  ; Z = 166
     dc.w 25115,1152
-    dc.l 79693312  ; Z=167
+    dc.l 79693312  ; Z = 167
     dc.w 24966,256
-    dc.l 79693568  ; Z=168
+    dc.l 79693568  ; Z = 168
     dc.w 24818,2128
-    dc.l 79692416  ; Z=169
+    dc.l 79692416  ; Z = 169
     dc.w 24672,1376
-    dc.l 79692736  ; Z=170
+    dc.l 79692736  ; Z = 170
     dc.w 24528,688
-    dc.l 79692224  ; Z=171
+    dc.l 79692224  ; Z = 171
     dc.w 24385,64
-    dc.l 79693568  ; Z=172
+    dc.l 79693568  ; Z = 172
     dc.w 24244,2272
-    dc.l 79692352  ; Z=173
+    dc.l 79692352  ; Z = 173
     dc.w 24105,1792
-    dc.l 79692288  ; Z=174
+    dc.l 79692288  ; Z = 174
     dc.w 23967,1376
-    dc.l 79692928  ; Z=175
+    dc.l 79692928  ; Z = 175
     dc.w 23831,1024
-    dc.l 79695424  ; Z=176
+    dc.l 79695424  ; Z = 176
     dc.w 23696,736
-    dc.l 79693760  ; Z=177
+    dc.l 79693760  ; Z = 177
     dc.w 23563,512
-    dc.l 79693504  ; Z=178
+    dc.l 79693504  ; Z = 178
     dc.w 23431,352
-    dc.l 79694976  ; Z=179
+    dc.l 79694976  ; Z = 179
     dc.w 23301,256
-    dc.l 79694336  ; Z=180
+    dc.l 79694336  ; Z = 180
     dc.w 23172,224
-    dc.l 79695296  ; Z=181
+    dc.l 79695296  ; Z = 181
     dc.w 23045,256
-    dc.l 79693888  ; Z=182
+    dc.l 79693888  ; Z = 182
     dc.w 22919,352
-    dc.l 79694080  ; Z=183
+    dc.l 79694080  ; Z = 183
     dc.w 22795,512
-    dc.l 79693504  ; Z=184
+    dc.l 79693504  ; Z = 184
     dc.w 22671,736
-    dc.l 79695104  ; Z=185
+    dc.l 79695104  ; Z = 185
     dc.w 22550,1024
-    dc.l 79691776  ; Z=186
+    dc.l 79691776  ; Z = 186
     dc.w 22429,1376
-    dc.l 79692544  ; Z=187
+    dc.l 79692544  ; Z = 187
     dc.w 22310,1792
-    dc.l 79692736  ; Z=188
+    dc.l 79692736  ; Z = 188
     dc.w 22192,2272
-    dc.l 79692224  ; Z=189
+    dc.l 79692224  ; Z = 189
     dc.w 22075,2816
-    dc.l 79692608  ; Z=190
+    dc.l 79692608  ; Z = 190
     dc.w 21959,368
-    dc.l 79695680  ; Z=191
+    dc.l 79695680  ; Z = 191
     dc.w 21845,1024
-    dc.l 79703552  ; Z=192
+    dc.l 79703552  ; Z = 192
     dc.w 21732,1744
-    dc.l 79694144  ; Z=193
+    dc.l 79694144  ; Z = 193
     dc.w 21620,2528
-    dc.l 79692096  ; Z=194
+    dc.l 79692096  ; Z = 194
     dc.w 21509,256
-    dc.l 79710400  ; Z=195
+    dc.l 79710400  ; Z = 195
     dc.w 21399,1152
-    dc.l 79694144  ; Z=196
+    dc.l 79694144  ; Z = 196
     dc.w 21290,2112
-    dc.l 79694720  ; Z=197
+    dc.l 79694720  ; Z = 197
     dc.w 21183,3136
-    dc.l 79692352  ; Z=198
+    dc.l 79692352  ; Z = 198
     dc.w 21076,1040
-    dc.l 79692352  ; Z=199
+    dc.l 79692352  ; Z = 199
     dc.w 20971,2176
-    dc.l 79694336  ; Z=200
+    dc.l 79694336  ; Z = 200
     dc.w 20867,160
-    dc.l 79692032  ; Z=201
+    dc.l 79692032  ; Z = 201
     dc.w 20763,1408
-    dc.l 79694592  ; Z=202
+    dc.l 79694592  ; Z = 202
     dc.w 20661,2720
-    dc.l 79692736  ; Z=203
+    dc.l 79692736  ; Z = 203
     dc.w 20560,832
-    dc.l 79693248  ; Z=204
+    dc.l 79693248  ; Z = 204
     dc.w 20460,2256
-    dc.l 79692096  ; Z=205
+    dc.l 79692096  ; Z = 205
     dc.w 20360,448
-    dc.l 79694016  ; Z=206
+    dc.l 79694016  ; Z = 206
     dc.w 20262,1984
-    dc.l 79692736  ; Z=207
+    dc.l 79692736  ; Z = 207
     dc.w 20164,256
-    dc.l 79696832  ; Z=208
+    dc.l 79696832  ; Z = 208
     dc.w 20068,1904
-    dc.l 79691840  ; Z=209
+    dc.l 79691840  ; Z = 209
     dc.w 19972,256
-    dc.l 79696704  ; Z=210
+    dc.l 79696704  ; Z = 210
     dc.w 19878,2016
-    dc.l 79692544  ; Z=211
+    dc.l 79692544  ; Z = 211
     dc.w 19784,448
-    dc.l 79693504  ; Z=212
+    dc.l 79693504  ; Z = 212
     dc.w 19691,2320
-    dc.l 79692864  ; Z=213
+    dc.l 79692864  ; Z = 213
     dc.w 19599,832
-    dc.l 79693632  ; Z=214
+    dc.l 79693632  ; Z = 214
     dc.w 19508,2816
-    dc.l 79692480  ; Z=215
+    dc.l 79692480  ; Z = 215
     dc.w 19418,1408
-    dc.l 79693120  ; Z=216
+    dc.l 79693120  ; Z = 216
     dc.w 19328,32
-    dc.l 79695808  ; Z=217
+    dc.l 79695808  ; Z = 217
     dc.w 19239,2176
-    dc.l 79694080  ; Z=218
+    dc.l 79694080  ; Z = 218
     dc.w 19152,880
-    dc.l 79692224  ; Z=219
+    dc.l 79692224  ; Z = 219
     dc.w 19065,3136
-    dc.l 79692992  ; Z=220
+    dc.l 79692992  ; Z = 220
     dc.w 18978,1920
-    dc.l 79694272  ; Z=221
+    dc.l 79694272  ; Z = 221
     dc.w 18893,736
-    dc.l 79692800  ; Z=222
+    dc.l 79692800  ; Z = 222
     dc.w 18808,3152
-    dc.l 79693504  ; Z=223
+    dc.l 79693504  ; Z = 223
     dc.w 18724,2048
-    dc.l 79697984  ; Z=224
+    dc.l 79697984  ; Z = 224
     dc.w 18641,976
-    dc.l 79692352  ; Z=225
+    dc.l 79692352  ; Z = 225
     dc.w 18558,3552
-    dc.l 79693312  ; Z=226
+    dc.l 79693312  ; Z = 226
     dc.w 18477,2560
-    dc.l 79692096  ; Z=227
+    dc.l 79692096  ; Z = 227
     dc.w 18396,1600
-    dc.l 79692480  ; Z=228
+    dc.l 79692480  ; Z = 228
     dc.w 18315,672
-    dc.l 79694464  ; Z=229
+    dc.l 79694464  ; Z = 229
     dc.w 18236,3456
-    dc.l 79692864  ; Z=230
+    dc.l 79692864  ; Z = 230
     dc.w 18157,2608
-    dc.l 79691520  ; Z=231
+    dc.l 79691520  ; Z = 231
     dc.w 18078,1792
-    dc.l 79695424  ; Z=232
+    dc.l 79695424  ; Z = 232
     dc.w 18001,1008
-    dc.l 79692992  ; Z=233
+    dc.l 79692992  ; Z = 233
     dc.w 17924,256
-    dc.l 79696704  ; Z=234
+    dc.l 79696704  ; Z = 234
     dc.w 17848,3296
-    dc.l 79692992  ; Z=235
+    dc.l 79692992  ; Z = 235
     dc.w 17772,2624
-    dc.l 79694144  ; Z=236
+    dc.l 79694144  ; Z = 236
     dc.w 17697,1984
-    dc.l 79693696  ; Z=237
+    dc.l 79693696  ; Z = 237
     dc.w 17623,1376
-    dc.l 79691840  ; Z=238
+    dc.l 79691840  ; Z = 238
     dc.w 17549,800
-    dc.l 79693568  ; Z=239
+    dc.l 79693568  ; Z = 239
     dc.w 17476,256
-    dc.l 79694656  ; Z=240
+    dc.l 79694656  ; Z = 240
     dc.w 17403,3600
-    dc.l 79673024  ; Z=241
+    dc.l 79673024  ; Z = 241
     dc.w 17331,3136
-    dc.l 79692992  ; Z=242
+    dc.l 79692992  ; Z = 242
     dc.w 17260,2704
-    dc.l 79691968  ; Z=243
+    dc.l 79691968  ; Z = 243
     dc.w 17189,2304
-    dc.l 79694912  ; Z=244
+    dc.l 79694912  ; Z = 244
     dc.w 17119,1936
-    dc.l 79692992  ; Z=245
+    dc.l 79692992  ; Z = 245
     dc.w 17050,1600
-    dc.l 79692032  ; Z=246
+    dc.l 79692032  ; Z = 246
     dc.w 16980,1296
-    dc.l 79692352  ; Z=247
+    dc.l 79692352  ; Z = 247
     dc.w 16912,1024
-    dc.l 79694272  ; Z=248
+    dc.l 79694272  ; Z = 248
     dc.w 16844,784
-    dc.l 79692352  ; Z=249
+    dc.l 79692352  ; Z = 249
     dc.w 16777,576
-    dc.l 79691520  ; Z=250
+    dc.l 79691520  ; Z = 250
     dc.w 16710,400
-    dc.l 79692672  ; Z=251
+    dc.l 79692672  ; Z = 251
     dc.w 16644,256
-    dc.l 79692480  ; Z=252
+    dc.l 79692480  ; Z = 252
     dc.w 16578,144
-    dc.l 79693504  ; Z=253
+    dc.l 79693504  ; Z = 253
     dc.w 16513,64
-    dc.l 79693056  ; Z=254
+    dc.l 79693056  ; Z = 254
     dc.w 16448,16
-    dc.l 79693760  ; Z=255
+    dc.l 79693760  ; Z = 255
     dc.w 16384,0
-    dc.l 79724480  ; Z=256
+    dc.l 79724480  ; Z = 256
     dc.w 16320,16
-    dc.l 79693760  ; Z=257
+    dc.l 79693760  ; Z = 257
     dc.w 16256,64
-    dc.l 79695808  ; Z=258
+    dc.l 79695808  ; Z = 258
     dc.w 16194,144
-    dc.l 79691328  ; Z=259
+    dc.l 79691328  ; Z = 259
     dc.w 16131,256
-    dc.l 79696000  ; Z=260
+    dc.l 79696000  ; Z = 260
     dc.w 16070,400
-    dc.l 79691200  ; Z=261
+    dc.l 79691200  ; Z = 261
     dc.w 16008,576
-    dc.l 79694528  ; Z=262
+    dc.l 79694528  ; Z = 262
     dc.w 15947,784
-    dc.l 79695104  ; Z=263
+    dc.l 79695104  ; Z = 263
     dc.w 15887,1024
-    dc.l 79693760  ; Z=264
+    dc.l 79693760  ; Z = 264
     dc.w 15827,1296
-    dc.l 79693696  ; Z=265
+    dc.l 79693696  ; Z = 265
     dc.w 15768,1600
-    dc.l 79689664  ; Z=266
+    dc.l 79689664  ; Z = 266
     dc.w 15709,1936
-    dc.l 79691264  ; Z=267
+    dc.l 79691264  ; Z = 267
     dc.w 15650,2304
-    dc.l 79694272  ; Z=268
+    dc.l 79694272  ; Z = 268
     dc.w 15592,2704
-    dc.l 79692480  ; Z=269
+    dc.l 79692480  ; Z = 269
     dc.w 15534,3136
-    dc.l 79693248  ; Z=270
+    dc.l 79693248  ; Z = 270
     dc.w 15477,3600
-    dc.l 79692736  ; Z=271
+    dc.l 79692736  ; Z = 271
     dc.w 15420,4096
-    dc.l 79694272  ; Z=272
+    dc.l 79694272  ; Z = 272
     dc.w 15363,256
-    dc.l 79716032  ; Z=273
+    dc.l 79716032  ; Z = 273
     dc.w 15307,800
-    dc.l 79694080  ; Z=274
+    dc.l 79694080  ; Z = 274
     dc.w 15252,1376
-    dc.l 79690560  ; Z=275
+    dc.l 79690560  ; Z = 275
     dc.w 15196,1984
-    dc.l 79693504  ; Z=276
+    dc.l 79693504  ; Z = 276
     dc.w 15141,2624
-    dc.l 79694912  ; Z=277
+    dc.l 79694912  ; Z = 277
     dc.w 15087,3296
-    dc.l 79693696  ; Z=278
+    dc.l 79693696  ; Z = 278
     dc.w 15033,4000
-    dc.l 79693696  ; Z=279
+    dc.l 79693696  ; Z = 279
     dc.w 14979,256
-    dc.l 79693952  ; Z=280
+    dc.l 79693952  ; Z = 280
     dc.w 14926,1008
-    dc.l 79692544  ; Z=281
+    dc.l 79692544  ; Z = 281
     dc.w 14873,1792
-    dc.l 79692864  ; Z=282
+    dc.l 79692864  ; Z = 282
     dc.w 14820,2608
-    dc.l 79693120  ; Z=283
+    dc.l 79693120  ; Z = 283
     dc.w 14768,3456
-    dc.l 79693248  ; Z=284
+    dc.l 79693248  ; Z = 284
     dc.w 14716,4336
-    dc.l 79693504  ; Z=285
+    dc.l 79693504  ; Z = 285
     dc.w 14665,672
-    dc.l 79693312  ; Z=286
+    dc.l 79693312  ; Z = 286
     dc.w 14614,1600
-    dc.l 79692480  ; Z=287
+    dc.l 79692480  ; Z = 287
     dc.w 14563,2560
-    dc.l 79697024  ; Z=288
+    dc.l 79697024  ; Z = 288
     dc.w 14513,3552
-    dc.l 79691712  ; Z=289
+    dc.l 79691712  ; Z = 289
     dc.w 14463,4576
-    dc.l 79690496  ; Z=290
+    dc.l 79690496  ; Z = 290
     dc.w 14413,976
-    dc.l 79693696  ; Z=291
+    dc.l 79693696  ; Z = 291
     dc.w 14364,2048
-    dc.l 79691840  ; Z=292
+    dc.l 79691840  ; Z = 292
     dc.w 14315,3152
-    dc.l 79691392  ; Z=293
+    dc.l 79691392  ; Z = 293
     dc.w 14266,4288
-    dc.l 79693056  ; Z=294
+    dc.l 79693056  ; Z = 294
     dc.w 14217,736
-    dc.l 79695360  ; Z=295
+    dc.l 79695360  ; Z = 295
     dc.w 14169,1920
-    dc.l 79694656  ; Z=296
+    dc.l 79694656  ; Z = 296
     dc.w 14122,3136
-    dc.l 79691776  ; Z=297
+    dc.l 79691776  ; Z = 297
     dc.w 14074,4384
-    dc.l 79694144  ; Z=298
+    dc.l 79694144  ; Z = 298
     dc.w 14027,880
-    dc.l 79693824  ; Z=299
+    dc.l 79693824  ; Z = 299
     dc.w 13981,2176
-    dc.l 79691776  ; Z=300
+    dc.l 79691776  ; Z = 300
     dc.w 13934,3504
-    dc.l 79693376  ; Z=301
+    dc.l 79693376  ; Z = 301
     dc.w 13888,32
-    dc.l 79693760  ; Z=302
+    dc.l 79693760  ; Z = 302
     dc.w 13842,1408
-    dc.l 79693056  ; Z=303
+    dc.l 79693056  ; Z = 303
     dc.w 13797,2816
-    dc.l 79693632  ; Z=304
-    section code,code
+    dc.l 79693632  ; Z = 304
         section code,code
 
 ; ------------------------------------------------------------------------
@@ -5608,8 +5712,8 @@ sc_elevation_magic:
 
 TB_R_PLANES equ 3
 
-; 68000 planar raster. Exact Q4 coverage, 320x200, three bitplanes.
-; Per-polygon hot calls use the private register ABI documented below.
+; Rasterize exact Q4 coverage on a 320 by 200 surface with three bitplanes.
+; The polygon routines use the register interfaces below.
 
 tb_r_sample_floor macro
         ext.l   d0
@@ -5617,8 +5721,8 @@ tb_r_sample_floor macro
         asr.l   #4,d0
         endm
 
-; Advance a surface pointer by 8*row + 32*row. Row is 0..200;
-; the source data register (now 32*row) has no later use at call sites.
+; Advance the surface pointer by 40 bytes for each row.
+; The first argument is a row in 0..200. This macro changes it to 32 * row.
 TB_ROW40_ADDRESS macro
         lsl.w   #3,\1
         adda.w  \1,\2
@@ -5627,9 +5731,10 @@ TB_ROW40_ADDRESS macro
         adda.w  \1,\2
         endm
 
-; Select once per polygon: d7=color, a0=surface byte alignment; a1=writer.
-; Each writer takes a0=row, d0.w=left, d1.w=exclusive right. Preserves
-; d6-d7/a2-a6 except the byte fallback, which also preserves them.
+; Select a span writer once for each polygon.
+; D7 is the ink. A0 is the surface base. Return the writer in A1.
+; Each writer takes the row in A0 and the left and exclusive right X in
+; D0.W and D1.W. All writers preserve D6-D7 and A2-A6.
 tb_r_writer:
         btst    #8,d7
         bne.w   tb_r_choose_dither
@@ -5647,7 +5752,7 @@ tb_r_writer:
         lea     tb_r_bytes(pc),a1
         rts
 
-; Odd buffers are unusual but legal. Byte bit writes never trap.
+; Use byte writes on odd addresses to prevent an address error.
 tb_r_bytes:
         movem.l d6-d7/a2,-(sp)
         movea.l a0,a2
@@ -5678,16 +5783,15 @@ tb_r_bytes:
         movem.l (sp)+,d6-d7/a2
         rts
 
-        ; Packed offset and mask for each endpoint. In the native layout
-        ; offsets are the low words, so span width needs no unpack.
-        ; Bias the right offset by -2 so the common two-word span is zero.
-        ; Right is indexed by exclusive X, including 320.
+        ; Each entry holds the mask and the byte offset. The offset is the low word.
+        ; Subtract 2 from the right offset so adjacent words give a zero distance.
+        ; Use the exclusive right X as an index. The last valid index is 320.
 tb_r_coord_table:
 span_x set 0
         rept 321
         dc.w ($ffff>>(span_x&15)),((span_x>>4)<<1)
         ifeq span_x
-        dc.w 0,-2                  ; empty prefix, actual seam offset zero
+        dc.w 0,-2                  ; The empty prefix has a seam offset of zero.
         else
         dc.w ($ffff<<(15-((span_x-1)&15)))&$ffff,(((span_x-1)>>4)<<1)-2
         endif
@@ -5704,10 +5808,10 @@ tb_r_colors:
         dc.w tb_r_color12-tb_r_colors,tb_r_color13-tb_r_colors
         dc.w tb_r_color14-tb_r_colors,tb_r_color15-tb_r_colors
 
-; Each color emits the same layout with a static operation per plane. One
-; word uses a word mask, adjacent words use one long mask, wider spans use
-; two partial edges and paired long interior stores. Row is always even.
-; Fourth argument is the complete destination effective address.
+; Generate one writer for each ink. Each writer uses a fixed operation for each plane.
+; A one-word span uses a word mask. A two-word span uses a longword mask.
+; Longer spans use two masked endpoints and paired longword stores.
+; The row address is even. Argument 4 is the full destination address expression.
 tb_r_lane macro
         ifne    (\1&\2)
         or.\3   d4,\4
@@ -5723,15 +5827,14 @@ tb_r_middle macro
         moveq   #0,d4
         endif
         lea     \3+2(a0),a1
-        ; D0 is dead after both cap writes. Leave D3 live for the
-        ; inside solid polygon walker across this callback.
+        ; Reuse D0 after the endpoint writes. Preserve the polygon walker's row count in D3.
         move.w  d2,d0
         lsr.w   #1,d0
         bcc.s   .even\@
         move.w  d4,(a1)+
 .even\@:
-        ; At most 18 interior words: enter a nine-store tail by count.
-        ; Every MOVE.L is one word of code, so -2*count selects the suffix.
+        ; Select a suffix of the nine longword stores for at most 18 interior words.
+        ; Each store occupies two code bytes. The byte displacement is -2 * the store count.
         add.w   d0,d0
         neg.w   d0
         jmp     .filled\@(pc,d0.w)
@@ -5744,7 +5847,7 @@ tb_r_middle macro
 TB_R_COLOR_INDEX_ENTRY equ 8
 
 tb_r_color macro
-        ; a0 row, d0/d1 coordinates, d2-d5 scratch.
+        ; A0 holds the row. D0/D1 hold the endpoints. Clobber D2-D5.
 .normal_x\@:
         lsl.w   #3,d0
         lsl.w   #3,d1
@@ -5757,24 +5860,24 @@ tb_r_color macro
         move.l  4(a1,d1.w),d5
         move.w  d4,d2
         adda.w  d2,a0
-        move.w  d5,d1              ; last byte offset
+        move.w  d5,d1
         swap    d5
         sub.w   d2,d1
         beq.w   .adjacent\@
         bmi.w   .single\@
-        ; A0 first word; D1 biased table distance; D4/D5 prepared caps.
-        ; Only model inks 4 and 6 use this entry, after one/two miss.
+        ; A0 points to the first word. D1 holds the biased distance. D4/D5 hold the endpoint masks.
+        ; Model inks 4 and 6 use this entry for spans longer than two words.
         ifeq (\1-4)*(\1-6)
 tb_r_color_model_prepared\1 equ *
         endif
         cmpi.w  #2,d1
         beq.w   .three\@
-        addq.w  #2,d1              ; actual distance for the wide writer
-        ; Alternate wide-only ABI: A0 first word; D1 true byte distance;
-        ; D4 the original packed left mask, D5.W right prefix.
+        addq.w  #2,d1              ; Recover the actual distance.
+        ; For a wide span, A0 points to the first word. D1 holds the actual byte distance.
+        ; D4 holds the original packed left entry. D5.W holds the right prefix mask.
 tb_r_color_wide\1 equ *
         swap    d4
-        move.w  d5,d0              ; retain right mask across left lane stores
+        move.w  d5,d0              ; Keep the right mask during the left writes.
         move.w  d4,d5
         not.w   d5
         tb_r_lane \1,1,w,(a0)
@@ -5794,7 +5897,7 @@ tb_r_color_wide\1 equ *
         tb_r_middle \1,1,0
         tb_r_middle \1,2,8000
         tb_r_middle \1,4,16000
-        lea     tb_r_coord_table(pc),a1  ; only the wide filler spills the table
+        lea     tb_r_coord_table(pc),a1  ; Restore the table after the wide write.
         rts
 .single\@:
         swap    d4
@@ -5814,8 +5917,8 @@ tb_r_color_wide\1 equ *
         tb_r_lane \1,4,l,16000(a0)
         rts
 .three\@:
-        ; Pair the left partial word with the full middle word.
-        ; The right edge is a separate masked word.
+        ; Write the left endpoint and full middle word as a longword.
+        ; Use a separate masked write for the right endpoint.
         move.w  d5,d0
         move.w  #-1,d4
         move.l  d4,d5
@@ -5849,9 +5952,8 @@ tb_r_color13: tb_r_color 13
 tb_r_color14: tb_r_color 14
 tb_r_color15: tb_r_color 15
 
-; Cold/general edge accumulator. The buffer is one LONG per sampled y,
-; holding min/max WORD crossings. It handles warped polygons and arbitrary
-; point counts, so native output does not silently discard unusual fixtures.
+; Accumulate the minimum and maximum crossings in one longword for each sampled row.
+; This fallback supports non-monotone polygons and variable vertex counts.
 tb_r_sum       equ -800
 tb_r_surface   equ -804
 tb_r_painter   equ -812
@@ -5866,7 +5968,7 @@ tb_r_edgelo    equ -838
 tb_r_edgehi    equ -840
 tb_r_edge_dy   equ -844
 tb_r_top       equ -848
-tb_r_draw_lane equ tb_r_top  ; top has been consumed before fused segment entry
+tb_r_draw_lane equ tb_r_top  ; Reuse the top slot after segment entry.
 tb_r_base      equ -852
 tb_r_limit     equ -856
 tb_r_forward   equ -860
@@ -5885,9 +5987,9 @@ tb_r_dither    equ -904
 ; Screen-anchored dither writers
 ; ------------------------------------------------------------------------
 
-; Ink bits 3:0/7:4 are colours for even/odd (x+y); bit 8 selects this
-; writer. A0 is the current row, which advances by 40 bytes. Bit 3 of
-; (row XOR base) is therefore the absolute Y parity, even for odd bases.
+; Bits 3:0 and 7:4 select the inks for even and odd (X + Y).
+; Bit 8 selects dither. A0 advances 40 bytes for each row.
+; Bit 3 of (row address XOR surface base) gives Y parity, also for odd bases.
 tb_r_choose_dither:
         move.w  d7,d2
         andi.w  #$ff,d2
@@ -5919,7 +6021,7 @@ tb_r_dither_bytes:
         eor.w   d3,d2
         movem.l d6-d7/a2,-(sp)
         movea.l a0,a2
-        move.l  tb_r_dither(a6),d7     ; use pattern address to find ink
+        move.l  tb_r_dither(a6),d7     ; Find the ink from its pattern address.
         lea     tb_r_dither_patterns(pc),a1
         sub.l   a1,d7
         lsr.w   #4,d7
@@ -5955,8 +6057,8 @@ tb_r_dither_bytes:
         movem.l (sp)+,d6-d7/a2
         rts
 
-; Masked writes preserve adjacent pixels. Full middle words are stores.
-; Second argument is the complete destination effective address.
+; Use masked writes to preserve adjacent pixels. Store full interior words directly.
+; Argument 2 is the full destination address expression.
 tb_r_dither_lane macro
         move.w  (a1)+,d2
         ifc \1,l
@@ -5985,10 +6087,9 @@ tb_r_dither_bounds macro
         sub.w   d2,d3
         endm
 
-; D0 yields zero or eight from the 40-byte row step.
+; Return zero or eight in D0 for the row phase.
 tb_r_dither_phase macro
-        ; A0 has shifted to the first word: subtract its byte offset in
-        ; D2 before deriving the Y phase.
+        ; Subtract the first word's byte offset in D2 to recover the row address in A0.
         move.l  a0,d0
         sub.w   d2,d0
         move.l  tb_r_surface(a6),d1
@@ -6023,11 +6124,11 @@ tb_r_dither_row:
         tb_r_dither_lane l,16000(a0)
         rts
 tb_r_dither_wide:
-        addq.w  #2,d3              ; actual distance for the wide writer
+        addq.w  #2,d3              ; Recover the actual distance.
         cmpi.w  #4,d3
         beq.w   .triple
-        ; All four planes share edge masks and width. Retain the mask
-        ; pointer in A1, and step A0 by the plane size for the next lane.
+        ; Reuse the masks and width for each plane. Keep the mask table in A1.
+        ; Advance A0 by one plane size after each lane.
         move.l  d6,-(sp)
         moveq   #(TB_R_PLANES-1),d6
 .plane:
@@ -6057,8 +6158,8 @@ tb_r_dither_wide:
         move.l  (sp)+,d6
         rts
 .triple:
-        ; The first edge and the full interior form a longword. D0
-        ; carries the right edge over those four planar lane operations.
+        ; Write the left endpoint and full interior word as a longword.
+        ; Keep the right endpoint in D0 until all plane writes are complete.
         move.w  d5,d0
         swap    d4
         move.w  #-1,d4
@@ -6077,9 +6178,9 @@ tb_r_dither_wide:
         tb_r_dither_lane w,16000(a0)
         rts
 
-; Prototype: specialize the published authored terrain inks for short
-; spans. Use the shared generic writer for 3+ words and other materials.
-; Fifth argument is the complete destination effective address.
+; Use short-span writers for the selected terrain inks.
+; Use the common writer for other inks and spans of three or more words.
+; Argument 5 is the full destination address expression.
 tb_r_dither_known_lane macro
         ifne (\1&\3)
         ifne (\2&\3)
@@ -6154,7 +6255,7 @@ tb_r_dither_65: tb_r_dither_known TP_65_EVEN,TP_65_ODD
 tb_r_dither_46: tb_r_dither_known TP_46_EVEN,TP_46_ODD
 tb_r_dither_c7: tb_r_dither_known TP_C7_EVEN,TP_C7_ODD
 
-        ; Authored tank track inks: bake the constant lanes into the short writers.
+        ; Generate fixed plane operations for the authored tank track inks.
 tb_r_dither_40: tb_r_dither_known 0,4
 tb_r_dither_42: tb_r_dither_known 2,4
 
@@ -6197,8 +6298,9 @@ tb_r_ink_select set 0
 tb_r_ink_select set tb_r_ink_select+1
         endr
 
-; Generated from palette indices, not artwork: each entry holds the
-; four big-endian plane words for even Y followed by four for odd Y.
+; Generate the entries from palette indices. Use four words for even Y,
+; then four for odd Y. Keep the fourth word in the table stride.
+; This renderer reads only the first three plane words for each phase.
 tb_r_dither_patterns:
 tb_r_ink set 0
         rept 256
@@ -6221,9 +6323,9 @@ tb_r_phase set $5555
 tb_r_ink set tb_r_ink+1
         endr
 
-; Private polygon ABI: A0=Q4 points, D7.w=count, D0=color, A6=surface.
-; Preserve A2 (scene), A5 (callback), A6 (surface); all other registers may
-; change. The emitter already protects its outer loop around face clipping.
+; Private polygon interface: A0 points to Q4 vertices. D7.W holds the vertex count.
+; D0 holds the ink. A6 points to the surface. Preserve A2, A5 and A6.
+; The caller saves the outer face loop before clipping.
 tb_span_poly_scene:
         moveq   #56,d1
 
@@ -6242,7 +6344,7 @@ tb_r_poly_reg:
         move.w  d7,d6
         move.l  d0,d7
 
-        ; Bounds: d2/d3 y min/max; d4/d5 x min/max.
+        ; D2/D3 hold the minimum and maximum Y. D4/D5 hold the minimum and maximum X.
         move.w  (a5),d4
         move.w  d4,d5
         move.w  2(a5),d2
@@ -6274,9 +6376,9 @@ tb_r_poly_reg:
         bne.s   .bounds
         move.l  a2,tb_r_top(a6)
         move.l  a0,tb_r_limit(a6)
-        ; Sampled X is floor((interpolated X + 8-epsilon)/16).
-        ; X endpoints in [-7,5128] bound both chains to pixels 0..320.
-        ; Save an inside flag only for the colour fused loop.
+        ; Use floor((interpolated X + 8 - epsilon) / 16) to sample X.
+        ; Endpoints in [-7,5128] keep both chains in 0..320 pixels.
+        ; Only the fused solid loop uses the inside flag.
         clr.b   tb_r_inside_x(a6)
         cmpi.w  #-7,d4
         blt.s   .edge_clip
@@ -6318,20 +6420,20 @@ tb_r_poly_reg:
         move.l  tb_r_surface(a6),d0
         btst    #0,d0
         bne.s   .general
-        ; Positive visible height already excludes a flat triangle.
+        ; A positive sampled height excludes a flat triangle.
         cmpi.w  #3,d6
         beq.s   .fused
         cmpi.w  #4,d6
         bne.s   .generic_monotone
 
-        ; A cyclic quad is non-monotone exactly when its opposite
-        ; vertex has a strictly smaller Y than both neighbours. Rotate
-        ; the four packed-vertex offsets around the existing minimum.
+        ; A cyclic quad is not Y-monotone if the vertex opposite the first minimum
+        ; has a strictly smaller Y than both its neighbours.
+        ; Rotate the four vertex offsets to start at the first minimum.
         movea.l tb_r_base(a6),a0
         move.l  tb_r_top(a6),d0
         sub.l   a0,d0
         eori.w  #8,d0
-        move.w  2(a0,d0.w),d1       ; Y opposite the minimum
+        move.w  2(a0,d0.w),d1       ; Load Y opposite the minimum.
         addq.w  #4,d0
         andi.w  #12,d0
         cmp.w   2(a0,d0.w),d1
@@ -6415,8 +6517,8 @@ tb_r_no_poly:
         moveq   #0,d0
         rts
 
-; input: a0/a1 point pointers (either orientation)
-; clobbers d0-d5/a0-a3, leaves outer edge iteration registers untouched.
+; A0 and A1 point to the edge endpoints in either order.
+; Clobber D0-D5 and A0-A3. Preserve the outer edge iteration registers.
 tb_r_accumulate:
         move.w  2(a0),d0
         move.w  2(a1),d1
@@ -6453,8 +6555,8 @@ tb_r_accumulate:
         lsl.w   #2,d2
         adda.w  d2,a2
 
-        ; pos = x0*(dy-sample) + x1*sample. Both weights are unsigned;
-        ; MULS plus correction supports the full int16 coordinate domain.
+        ; Compute x0 * (dy - sample) + x1 * sample with unsigned weights.
+        ; Correct MULS for unsigned weights over the full signed 16-bit coordinate range.
         lsl.w   #4,d0
         addq.w  #8,d0
         sub.w   tb_r_edgelo(a6),d0
@@ -6491,8 +6593,8 @@ tb_r_accumulate:
 .bias:
         move.l  d0,tb_r_x(a6)
         move.l  d2,tb_r_rem(a6)
-        ; A single row never needs a y-step. With >=2 sampled rows the
-        ; quotient fits DIVU's word because dy>16 and abs(dx)<=65535.
+        ; Skip the Y step for one sampled row. With two or more rows, dy > 16.
+        ; With abs(dx) <= 65535, the DIVU quotient then fits in a word.
         tst.w   d5
         beq.s   .single
         ext.l   d4
@@ -6502,7 +6604,7 @@ tb_r_accumulate:
         lsl.l   #4,d0
         bsr.w   tb_r_div_floor
         move.l  d0,tb_r_stepx(a6)
-        move.l  d2,d4              ; step remainder
+        move.l  d2,d4
         move.l  tb_r_x(a6),d3
         move.l  tb_r_rem(a6),d2
 .loop:
@@ -6538,9 +6640,9 @@ tb_r_accumulate:
         move.w  d0,2(a2)
         rts
 
-; d0 = signed numerator, d1 = strictly positive unsigned word denominator.
-; Returns floor quotient in d0.l and nonnegative remainder in d2.l.
-; The caller's convex blend or >=2-row step guarantees a word DIVU quotient.
+; D0 is the signed numerator. D1 is a positive unsigned word denominator.
+; Return the floor quotient in D0.L and the nonnegative remainder in D2.L.
+; The caller's convex blend or multi-row step keeps the DIVU quotient in range.
 tb_r_div_floor:
         tst.l   d0
         bmi.s   .negative
@@ -6568,13 +6670,13 @@ tb_r_div_floor:
 .done:
         rts
 
-; The fast path needs exactly two cyclic direction changes in y. Plateaux
-; neither open nor close a chain. Non-monotone inputs fall back to min/max
-; accumulation above to preserve coverage for warped faces.
+; The fast path needs exactly two cyclic Y direction changes.
+; Equal Y values do not start or stop a chain.
+; Use minimum and maximum accumulation for non-monotone faces.
 tb_r_monotone:
-        ; Walk from the known first minimum. The caller rejected a flat
-        ; sampled interval. After the first strict fall, another rise is
-        ; exactly a third cyclic direction change. Equal Ys are neutral.
+        ; Start at the known first minimum. The caller excludes a flat interval.
+        ; A rise after the first strict fall is a third cyclic direction change.
+        ; Ignore equal Y values.
         movea.l tb_r_top(a6),a0
         movea.l tb_r_limit(a6),a1
         move.w  d6,d4
@@ -6616,7 +6718,7 @@ tb_r_monotone:
         rts
 
 tb_r_advance_pair macro
-        ; The long add's sign is the biased remainder's sign.
+        ; Use the sign of the longword sum to test the sign of the biased remainder.
         add.l   a2,d6
         bpl.s   .step_back\@
         add.l   tb_r_fcorrect(a6),d6
@@ -6635,16 +6737,16 @@ tb_r_advance_pair macro
         endif
         endm
 
-; A4 already points at the live row; select a colour once per segment,
-; then keep the shared coordinate table and row end live across rows.
+; A4 points to the current row. Select the ink once for each segment.
+; Keep the coordinate table and the segment end live across rows.
 tb_r_solid_model macro
         lea     tb_r_coord_table(pc),a1
-        movea.l a0,a5               ; exclusive segment end from setup
+        movea.l a0,a5               ; Keep the exclusive segment end.
 .model_row\@:
         move.l  d6,d0
         move.l  d7,d1
-        ; Inside guard bounds the biased sample to >=0. Quantize and
-        ; scale in one pass: floor(Xq4/16)*8 = (Xq4 & $fff0)/2.
+        ; The inside guard makes the biased sample nonnegative.
+        ; Quantize and scale together: floor(Xq4 / 16) * 8 = (Xq4 AND $fff0) / 2.
         andi.w  #$7ff0,d0
         andi.w  #$7ff0,d1
         lsr.w   #1,d0
@@ -6663,10 +6765,10 @@ tb_r_solid_model macro
         movea.l a4,a0
         beq.s   .model_two\@
         bmi.s   .model_one\@
-        adda.w  d2,a0              ; same first-word address as generic entry
-        move.w  d3,d1              ; preserve the existing width bias
+        adda.w  d2,a0
+        move.w  d3,d1              ; Keep the existing width bias.
         bsr.w   tb_r_color_model_prepared\1
-        ; Three-word writer keeps A1; wider writer already restores it.
+        ; The three-word writer preserves A1. The wide writer restores A1.
         bra.s   .model_step\@
 .model_one\@:
         adda.w  d2,a0
@@ -6694,12 +6796,12 @@ tb_r_solid_model macro
         endm
 
 tb_r_inside_endpoints macro
-        ; The backward edge is usually left. Handle both windings and
-        ; empty rows without changing the exclusive endpoint rule.
+        ; The backward edge is usually on the left.
+        ; Handle both windings and empty rows. Keep the right endpoint exclusive.
         move.l  d7,d0
         move.l  d6,d1
         ifc '\3','index'
-        ; Inside-X guard gives nonnegative Xq4; floor(Xq4/16)*8.
+        ; The inside guard makes Xq4 nonnegative. Compute floor(Xq4 / 16) * 8.
         andi.w  #$7ff0,d0
         andi.w  #$7ff0,d1
         lsr.w   #1,d0
@@ -6722,15 +6824,15 @@ tb_r_make_seg_end macro
         TB_ROW40_ADDRESS d0,a0
         endm
 
-; Each edge keeps [signed xQ4 | remainder+32768-dy] in d6/d7. a2/a3
-; hold [step xQ4 | step remainder] across the painter. For 1<=dy<=32767,
-; adding the step cannot carry from the low word, and its sign bit becomes
-; set exactly when correction is due. Adding 65536-dy restores the
-; biased remainder and increments x. Typed playback transposes these two
-; fields: [remainder+32768-dy | xQ4+32768], with a signed step addition
-; and correction 1-(dy<<16). The chain emits this representation directly.
-        ; A0 top, D0.w first row, D7 ink, A4 page. The only fields
-        ; published are the live edge/cursor state of the shared walker.
+; D6/D7 hold [signed Xq4 | remainder + 32768 - dy]. A2/A3 hold the packed steps.
+; For 1 <= dy <= 32767, the step cannot carry out of the low word.
+; Its sign bit becomes set when the remainder needs correction.
+; Add 65536 - dy to correct the remainder and increment X.
+; The typed path instead uses [remainder + 32768 - dy | Xq4 + 32768].
+; It adds a signed step and uses correction 1 - (dy << 16).
+; The chain produces this representation directly.
+        ; A0 points to the top vertex. D0.W is the first row. D7 is the ink.
+        ; A4 points to the page. Save only the active state of the shared edge walker.
         macro TB_R_FUSED_START
         btst    #8,d7
         beq.s   .plain_painter\@
@@ -6751,10 +6853,9 @@ tb_r_fused:
         movea.l tb_r_painter(a6),a5
         TB_R_FUSED_START
 tb_r_fused_segment:
-        ; A4 current row, A5 writer; both chains are unpublished at
-        ; the first shared row and advanced by the same exact walker.
-        ; The inside/dither class and writer are invariant
-        ; for this polygon, including across either chain's restarts.
+        ; A4 points to the current row. A5 holds the writer.
+        ; Both chains start at the first shared row and use the same walker.
+        ; Keep the writer and its inside/dither classification when a chain restarts.
         tst.b   tb_r_inside_x(a6)
         beq.s   .choose_colour
         bpl.s   .choose_inside
@@ -6783,23 +6884,23 @@ tb_r_fused_segment:
         move.w  tb_r_row(a6),d0
 .segment_row_ready:
 .begin_forward:
-        ; Entry initialized both stops to this row. Only the next
-        ; segment's tail has to choose which edge restarts.
+        ; Both stops initially equal the current row.
+        ; A segment tail chooses which edge to restart.
         movea.l tb_r_forward(a6),a0
-        move.w  d0,d2              ; pass the current row already in D0
+        move.w  d0,d2
         bsr.w   tb_r_chain_edge_forward
         move.l  a0,tb_r_forward(a6)
         move.l  d0,d6
         movea.l d1,a2
         move.w  d3,tb_r_fstop(a6)
         move.l  d2,tb_r_fcorrect(a6)
-        move.w  tb_r_row(a6),d0      ; forward call consumed D0
+        move.w  tb_r_row(a6),d0      ; Reload the row after the forward call.
 .reverse_row_ready:
         cmp.w   tb_r_bstop(a6),d0
         bne.s   .segment_end
 .begin_backward:
         movea.l tb_r_back(a6),a0
-        move.w  d0,d2              ; pass the current row already in D0
+        move.w  d0,d2
         bsr.w   tb_r_chain_edge_back
         move.l  a0,tb_r_back(a6)
         move.l  d0,d7
@@ -6817,7 +6918,7 @@ tb_r_fused_segment:
 .solid_prep:
         move.w  d0,d3
         sub.w   tb_r_row(a6),d3
-        subq.w  #1,d3               ; nonempty segment; solid callback keeps count
+        subq.w  #1,d3               ; The solid writer preserves the row count.
         move.w  d0,tb_r_row(a6)
         lea     tb_r_coord_table(pc),a1
         addq.l  #TB_R_COLOR_INDEX_ENTRY,a5
@@ -6833,7 +6934,7 @@ tb_r_fused_segment:
         bra.w   .next_segment
 .inside_prep:
         tb_r_make_seg_end
-        move.l  a0,tb_r_seg_end(a6) ; patterned callback clobbers D3
+        move.l  a0,tb_r_seg_end(a6) ; The dither writer changes D3.
 .inside:
         tb_r_inside_endpoints .inside_ordered,.inside_step
 .inside_ordered:
@@ -6888,10 +6989,10 @@ tb_r_fused_segment:
         tb_r_make_seg_end
         tb_r_solid_model 6
 
-; Packed DIVS result: [nonnegative remainder | signed floor quotient].
-; The sampled offset lies inside the edge; the first quotient fits within
-; +/-32001 from the X guard. Two sampled rows imply dy >= 17, bounding the
-; step quotient to +/-30118. The general accumulator still uses DIVU.
+; Pack the corrected DIVS result as [nonnegative remainder | signed floor quotient].
+; The first sample lies within the edge. The X guard bounds its quotient to +/-32001.
+; Two sampled rows imply dy >= 17 and bound the step quotient to +/-30118.
+; The general accumulator uses DIVU.
 TB_R_PACKED_EDGE_DIV macro
         divs.w  d1,d0
         tst.l   d0
@@ -6903,14 +7004,13 @@ TB_R_PACKED_EDGE_DIV macro
 .nonnegative\@:
         endm
 
-; A0 = previous vertex, D2.W = current row. Direction-specific entry
-; points walk the same packed Q4 polygon in opposite directions.
-; Returns next vertex in a0,
-; packed x/rem in d0, packed step in d1, correction in d2, stop y in d3.
-; d6/d7/a2-a5 remain live for the other active edge.
+; A0 points to the previous vertex. D2.W holds the current row.
+; Each direction entry walks the packed Q4 vertices in its own direction.
+; Return the next vertex in A0, packed X and remainder in D0, packed step in D1,
+; correction in D2 and stop row in D3. Preserve D6-D7 and A2-A5 for the other edge.
 tb_r_chain_edge_forward:
         moveq   #4,d5
-        ; Only Y greater than the current pixel centre reaches a later row.
+        ; Only a Y after the current pixel centre can reach a later sample row.
         move.w  d2,d3
         lsl.w   #4,d3
         addq.w  #8,d3
@@ -6933,15 +7033,15 @@ tb_r_chain_back_walk:
         subq.l  #4,a1
 tb_r_chain_bounds:
         move.w  2(a1),d1
-        cmp.w   d3,d1              ; (Y+7)>>4 > row iff Y > row*16+8
+        cmp.w   d3,d1              ; Test (Y + 7) >> 4 > row.
         bgt.s   .active
         movea.l a1,a0
         tst.w   d5
         bpl.s   tb_r_chain_forward_walk
         bra.s   tb_r_chain_back_walk
 .active:
-        ; D3 is the nonnegative sample. Only Y > D3 reaches here,
-        ; so Y+7 fits unsigned sixteen bits, even for Y=$7fff.
+        ; D3 holds the nonnegative sample Y. Only Y > D3 reaches this code.
+        ; Y + 7 fits in an unsigned word, including when Y is $7fff.
         move.w  d1,d0
         addq.w  #7,d0
         lsr.w   #4,d0
@@ -6949,15 +7049,15 @@ tb_r_chain_bounds:
         ble.s   .stop
         move.w  tb_r_endrow(a6),d0
 .stop:
-        exg     d0,d3              ; sampled Y in D0, stop row in D3
-        sub.w   d3,d2              ; negative row count, retained until step decision
-        move.w  2(a0),d5           ; raw Y0 serves dy and phase; walk direction is dead
-        sub.w   d5,d1              ; dy: positive signed word
-        sub.w   d5,d0              ; first sample's offset in [0,dy)
+        exg     d0,d3              ; Put the sampled Y in D0 and stop row in D3.
+        sub.w   d3,d2              ; Keep the negative row count until the step test.
+        move.w  2(a0),d5           ; Reuse D5 for Y0, which gives dy and phase.
+        sub.w   d5,d1              ; Compute positive dy.
+        sub.w   d5,d0              ; The first sample offset is in [0, dy).
         move.w  (a0),d4
         move.w  (a1),d5
-        sub.w   d4,d5              ; packed X guard makes dx a signed word
-        addi.w  #$8008,d4          ; unsigned biased X and pixel centre
+        sub.w   d4,d5              ; The X limits keep dx within a signed word.
+        addi.w  #$8008,d4          ; Apply the unsigned bias and sample offset.
         tst.w   d5
         beq.s   .integral_start
         tst.w   d0
@@ -6973,13 +7073,13 @@ tb_r_chain_bounds:
         move.w  d5,d0
         ext.l   d0
         lsl.l   #4,d0
-        ; (nonnegative remainder << 16) + signed quotient.
+        ; Pack the result as (nonnegative remainder << 16) + signed quotient.
         divs.w  d1,d0
         tst.l   d0
         bmi.s   .negative_remainder
         tst.w   d0
         bpl.s   .done
-        subi.l  #$10000,d0        ; exact negative quotient borrows
+        subi.l  #$10000,d0        ; Cancel the borrow from the signed quotient.
         bra.s   .done
 .negative_remainder:
         swap    d0
@@ -6989,7 +7089,7 @@ tb_r_chain_bounds:
         subq.w  #1,d0
         bra.s   .done
 .integral_start:
-        subq.w  #1,d4             ; floors -1/dy = -1 with remainder dy-1
+        subq.w  #1,d4             ; Use floor(-1 / dy) = -1 and remainder dy - 1.
         swap    d4
         move.w  d1,d4
         subq.w  #1,d4
@@ -7001,7 +7101,7 @@ tb_r_chain_bounds:
 .single:
         moveq   #0,d0
 .done:
-        ; Setup publishes [r+32768-dy | x+32768] with 1<=dy<=32767.
+        ; Return [remainder + 32768 - dy | X + 32768], with 1 <= dy <= 32767.
         swap    d4
         sub.w   d1,d4
         eori.w  #$8000,d4
@@ -7009,7 +7109,7 @@ tb_r_chain_bounds:
         move.w  d1,d2
         neg.w   d2
         swap    d2
-        move.w  #1,d2             ; 1 - (dy << 16)
+        move.w  #1,d2             ; Set the correction to 1 - (dy << 16).
         move.l  d0,d1
         move.l  d4,d0
         movea.l a1,a0
@@ -7019,10 +7119,9 @@ tb_r_chain_bounds:
 ; Terrain quad edge walker and span dispatch
 ; ------------------------------------------------------------------------
 
-; Specialized renderer for the regular terrain lattice.
-; The geometry producer's face order and signed-depth painter order are
-; unchanged. All exceptional geometric cases use the existing renderer.
-; Fixed ordinals 0,2,4,6 index the source offsets in cyclic winding.
+; Rasterize the regular terrain lattice without changing the producer or painter order.
+; Use the general renderer for geometry outside the fast path limits.
+; Ordinals 0, 2, 4 and 6 index the source offsets in winding order.
 
 ; ------------------------------------------------------------------------
 ; Terrain solid span writers
@@ -7036,17 +7135,17 @@ tb_q_solid_step macro
         rts
         endm
 
-; The ordinary terrain chain supplies two Q16 stepper states (D6/D7),
-; increments (A2/A3), first row (A4), and row count minus one (D3).
-; Keep the coordinate table live, leaving the logical next row in A5.
-; Each material statically sets/clears the same three planes.
-; Keep local loop tails for one- and two-word spans: together they cover
-; most rows, so duplicating the small tail avoids a branch on both paths.
+; D6/D7 hold the two Q16 edge states. A2/A3 hold their increments.
+; A4 points to the first row and D3 holds the row count minus one.
+; Keep the coordinate table live. A5 retains the logical next row.
+; Each material has fixed set and clear operations for the three planes.
+; One- and two-word spans account for most rows. Give each a local loop tail
+; to avoid a branch on both common paths.
 tb_q_solid macro
         lea     tb_r_coord_table(pc),a1
 .solid_row\@:
-        ; In the usual winding the backward edge is on the left.
-        ; Keep the exact comparison and swap only for the other winding.
+        ; The backward edge is usually on the left. Compare both edges and swap
+        ; only for the opposite winding.
         move.l  d7,d0
         move.l  d6,d1
         swap    d0
@@ -7062,7 +7161,7 @@ tb_q_solid macro
         move.l  4(a1,d1.w),d5
         movea.l a4,a0
         adda.w  d4,a0
-        sub.w   d4,d5              ; first/last physical word separation
+        sub.w   d4,d5              ; Compute the physical word separation.
         beq.s   .solid_two\@
         bmi.s   .solid_one\@
         subq.w  #2,d5
@@ -7077,9 +7176,8 @@ tb_q_solid macro
         subq.w  #2,d5
         beq.w   .solid_six\@
         endif
-        ; Width checks left D5.W biased by the tested thresholds.
-        ; Both coordinate-table layouts put the right mask in D5.H here.
-        ; Rejoin the exact cap/interior writer after its own width tests.
+        ; The width tests leave the tested bias in D5.W. Both table layouts put the
+        ; right mask in D5.H. Join the endpoint and interior writer after its width tests.
         move.w  d5,d1
         ifeq (\1-2)*(\1-5)
         addi.w  #10,d1
@@ -7091,7 +7189,7 @@ tb_q_solid macro
         endif
         endif
         swap    d5
-        ; The packed wide body keeps D3 and reestablishes A1 on return.
+        ; The packed wide writer preserves D3 and restores A1.
         bsr.w   tb_r_color_wide\1
         bra.s   .solid_step\@
 .solid_one\@:
@@ -7110,7 +7208,7 @@ tb_q_solid macro
         tb_q_solid_lanes \1,l,0,d5
         tb_q_solid_step .solid_row\@
 .solid_three\@:
-        ; Retain the right prefix in D5 while D2 complements the first long.
+        ; Keep the right prefix mask in D5 while D2 complements the first longword.
         move.w  #-1,d4
         move.l  d4,d2
         not.l   d2
@@ -7123,7 +7221,7 @@ tb_q_solid macro
         tb_q_solid_step .solid_row\@
         ifeq (\1-2)*(\1-5)*(\1-6)
 .solid_four\@:
-        ; Preserve the prefix until the second [full,prefix] long.
+        ; Keep the right prefix mask until the second [full word, prefix] write.
         move.w  #-1,d4
         move.l  d4,d2
         not.l   d2
@@ -7146,7 +7244,7 @@ tb_q_solid macro
         endif
         endm
 
-; Fourth argument is the complete destination effective address.
+; Argument 4 is the full destination address expression.
 tb_q_solid_lane macro
         ifne    (\1&\2)
         or.\3   d4,\4
@@ -7165,9 +7263,9 @@ tb_q_solid_lanes macro
         tb_q_solid_lane \1,4,\2,16000+\3(a0),\4
         endm
 
-; Five or six words: draw [suffix,full] and [full,prefix] caps, with
-; one or two fully owned words between. Opcode size and right-cap offset
-; are known by the exact width test; reuse source without a hot branch.
+; For five or six words, write [suffix, full word] and [full word, prefix],
+; with one or two full interior words between. Use the known width to select
+; the instruction size and right endpoint offset at assembly time.
 tb_q_solid_mid_caps macro
         move.w  #-1,d4
         move.l  d4,d2
@@ -7212,7 +7310,7 @@ tb_q_solid_table:
         dc.w tb_q_solid2-tb_q_paint_base,tb_q_solid3-tb_q_paint_base
         dc.w tb_q_solid4-tb_q_paint_base,tb_q_solid5-tb_q_paint_base
         dc.w tb_q_solid6-tb_q_paint_base,tb_q_solid7-tb_q_paint_base
-; Word table of byte offsets, indexed by scanline or segment height.
+; Index the table of word displacements by scanline or segment height.
 tb_q_row_offsets:
 tb_q_row_n set 0
         rept 201
@@ -7228,23 +7326,21 @@ tb_q_add_rows macro
 tb_q_frame_painter  equ -4
 tb_q_frame_base     equ -8
 tb_q_frame_endrow   equ -10
-; These two words must stay adjacent, backward first.
+; Keep the two words adjacent. Put the backward word first.
 tb_q_frame_fstop    equ -12
 tb_q_frame_bstop    equ -14
 tb_q_frame_fcorrect equ -18
 tb_q_frame_bcorrect equ -22
 
-        ; The first four words select a starting corner; the repeated
-        ; three-word tail lets either cursor walk its complete chain
-        ; without wrapping, re-indexing, or touching a different quad.
+        ; The first four words select the starting corner.
+        ; The repeated three-word tail lets each cursor finish without wrapping.
 tb_q_forward_offsets:
         dc.w 0,SC_GRID_WIDTH*8,(SC_GRID_WIDTH+1)*8,8
         dc.w 0,SC_GRID_WIDTH*8,(SC_GRID_WIDTH+1)*8
 tb_q_reverse_offsets:
         dc.w 0,8,(SC_GRID_WIDTH+1)*8,SC_GRID_WIDTH*8
         dc.w 0,8,(SC_GRID_WIDTH+1)*8
-        ; Relocate once when loading the Hunk, not on every quad.
-        ; The cursor points to the next candidate, after the minimum.
+        ; Relocate these addresses at load time. Each cursor starts after the minimum.
 tb_q_initial_cursors:
         dc.l tb_q_forward_offsets+2,tb_q_reverse_offsets+2
         dc.l tb_q_forward_offsets+4,tb_q_reverse_offsets+8
@@ -7266,9 +7362,9 @@ tb_q_extrema macro
 .extrema_done\@:
         endm
 
-; Private quad ABI: A2=scene, A4=strip record, A6=page. D6/A3/A6
-; survive the accepted path (D0=1, Z clear); A2/A4/A5/D7 survive only
-; rejection (D0=0, Z set). The draw loop owns their live bindings.
+; Private quad interface: A2 points to the scene, A4 to the strip record, and A6 to the page.
+; On acceptance, return D0 = 1 and clear Z. Preserve D6, A3 and A6.
+; On rejection, return D0 = 0 and set Z. Preserve A2, A4, A5 and D7.
         macro tb_q_inline_edge
         movea.l tb_q_frame_base(a6),a1
         move.w  -2(a0),d2
@@ -7284,42 +7380,42 @@ tb_q_extrema macro
         move.w  d4,d2
         bra.s   .advance\@
 .active\@:
-        ; EXG returns the rounded stop in D3 and recovers raw Y in
-        ; D1. Each dy consumer uses D1.W until replacing all of D1.
+        ; EXG puts the rounded stop in D3 and the raw Y in D1.
+        ; Use D1.W for dy before replacing the full register.
         exg     d1,d3
-        move.w  4(a1,d2.w),d0      ; y0
-        sub.w   d0,d1              ; dy
-        ; A chain hand-off is at a corner's sampled row. Skipped
-        ; corners on an admitted Y-monotone chain share that row.
-        moveq   #15,d5             ; dispatch cells ordered by raw Y fraction
+        move.w  4(a1,d2.w),d0
+        sub.w   d0,d1
+        ; Restart a chain at the corner's sampled row.
+        ; Skipped corners on a Y-monotone chain have that same sample row.
+        moveq   #15,d5             ; Index code cells by the raw Y fraction.
         and.w   d0,d5
-        move.w  (a1,d2.w),d0       ; x0
-        move.w  (a1,d4.w),d4       ; x1
-        sub.w   d0,d4              ; dx
+        move.w  (a1,d2.w),d0
+        move.w  (a1,d4.w),d4
+        sub.w   d0,d4
         addq.w  #8,d0
-        ; Positive dY is bounded by the projected Y guard (2319).
-        ; Very short one-sample edges use exact signed division.
+        ; The 2319-unit Y guard bounds positive dy.
+        ; Use exact signed division for the short one-row edges.
         cmpi.w  #4,d1
         blo.w   .tiny\@
         add.w   d1,d1
         add.w   d1,d1
         lea     tb_q_slope_table(pc),a1
-        ; Long fetch retains the shift in D2's low six bits. Put dX
-        ; in the source of MULS: typical traced dX has fewer run edges.
+        ; Keep the shift count in the six low bits of D2.
+        ; Use dX as the MULS source. Traced dX values typically have fewer bit transitions.
         move.l  (a1,d1.w),d2
         move.l  d2,d1
         swap    d1
         muls.w  d4,d1
-        asr.l   d2,d1              ; normalize to Q16 pixels/row
+        asr.l   d2,d1              ; Convert to Q16 pixels per row.
         move.l  d1,d4
-        ; The viewport margin ensures biased X is nonnegative.
+        ; The viewport margin makes the biased X nonnegative.
         swap    d0
         clr.w   d0
         lsr.l   #4,d0
-        ; Compute floor((step * first-sample offset)/16).
-        ; Raw Y fraction indexes 16-byte code cells. Their order
-        ; incorporates phase = (8 - Y) & 15 without a live subtraction.
-        ; Each computes floor(step * phase / 16); zero skips the add.
+        ; Compute floor(step * first sample offset / 16) for the first sample.
+        ; The raw Y fraction indexes 16-byte code cells.
+        ; Their order gives phase = (8 - Y) AND 15 without a subtraction.
+        ; Each cell computes floor(step * phase / 16). Phase zero skips the add.
         lsl.w   #4,d5
         jmp     .phase8\@(pc,d5.w)
 .phase8\@:
@@ -7425,10 +7521,10 @@ tb_q_extrema macro
 .phase_add\@:
         add.l   d4,d0
 .slope_ready\@:
-        subq.l  #1,d0               ; retain exclusive tie in the quantized domain
+        subq.l  #1,d0               ; Keep the exclusive tie rule after quantization.
         bra.w   .inline_end\@
 .tiny\@:
-        ; Tiny edges use the actual phase, not the raw dispatch index.
+        ; Use the actual phase for short edges, not the raw table index.
         neg.w   d5
         addq.w  #8,d5
         andi.w  #15,d5
@@ -7440,29 +7536,28 @@ tb_q_extrema macro
         swap    d0
         clr.w   d0
         lsr.l   #4,d0
-        moveq   #0,d1              ; dY < 4 guarantees one sampled row
+        moveq   #0,d1              ; dy < 4 permits only one sampled row.
         bra.w   .inline_end\@
 .inline_end\@:
         endm
 
         xdef tb_terrain_quad_scene
-; No drawable sample rows under the in-viewport admission bounds.
-; Return Z set (the fallback branch), with D0 negative as a no-draw tag.
+; Return Z set if no sample rows are drawable within the viewport.
+; Return a negative D0 to distinguish this case from other rejections.
 tb_q_empty:
         moveq   #-1,d0
         cmp.b   d0,d0
         rts
 
-; A0 is the first exterior node's X word, A4 its solid ink record,
-; A6 the page. Use the original grid instead of a packed temporary.
-; Cyclic outline: TL, BL, BM, BR, TR, TM. Return as an admitted quad.
+; A0 points to the first outer node's X word. A4 points to its solid ink record.
+; A6 points to the page. Use the source grid, not a packed copy.
+; The outline is TL, BL, BM, BR, TR, TM. Return as for an accepted quad.
 TB_SIX_BL equ SC_GRID_WIDTH*8
 TB_SIX_BM equ TB_SIX_BL+8
 TB_SIX_BR equ TB_SIX_BL+16
 tb_terrain_outer_six:
-        ; The certified rails are monotone: only the four outside
-        ; corners determine the sampled extrema. Either location
-        ; on a minimum plateau reaches the same active edges.
+        ; The checked rails are monotone. Only the four outside corners set the sample limits.
+        ; Either end of a minimum plateau gives the same active edges.
         moveq   #0,d0
         move.w  4(a0),d1
         movea.w d1,a1
@@ -7611,10 +7706,9 @@ tb_long_4_init:
         dc.l tb_long_4_fwd+20,tb_long_4_rev+4
 
 tb_terrain_quad_scene:
-        ; D0 is the implicit lattice index, A4 points to kind/solid ink.
-        ; The single playable path owns its aligned back page.
-        ; The authored strip supplies solid inks. Future materials
-        ; outside this kernel's contract use the existing face fallback.
+        ; D0 is the implicit lattice index. A4 points to the kind and solid ink.
+        ; The authored strip uses an aligned back page and solid inks.
+        ; Use the general face path for other materials.
         cmpi.b  #8,1(a4)
         bhs.w   tb_r_no_poly
         lea     sc_outcode(a2),a0
@@ -7623,14 +7717,13 @@ tb_terrain_quad_scene:
         lea     SC_GRID_WIDTH(a0),a0
         or.b    (a0,d0.w),d1
         or.b    1(a0,d0.w),d1
-        andi.b  #$21,d1             ; near-plane or exact viewport gate
+        andi.b  #$21,d1             ; Test the near plane and viewport limits.
         bne.w   tb_r_no_poly
         lsl.w   #3,d0
         lea     sc_projected+2(a2),a0
         adda.w  d0,a0
-        ; Keep all four raw projected Ys in registers: the opposite
-        ; corner check reuses them rather than loading them a second time.
-        moveq   #0,d0              ; ordinal of first minimum
+        ; Keep the four raw projected Y values for the opposite corner test.
+        moveq   #0,d0              ; Start with corner zero as the first minimum.
         move.w  4(a0),d2
         move.w  4+SC_GRID_WIDTH*8(a0),d3
         move.w  4+(SC_GRID_WIDTH+1)*8(a0),d4
@@ -7640,8 +7733,8 @@ tb_terrain_quad_scene:
         tb_q_extrema d3,2
         tb_q_extrema d4,4
         tb_q_extrema d5,6
-        ; Check the same strict opposite local minimum, selecting its
-        ; neighbouring register pair by first-minimum ordinal.
+        ; Check for a strict opposite local minimum.
+        ; Select the neighbour registers from the ordinal of the first minimum.
         tst.w   d0
         beq.s   .minimum0
         cmpi.w  #6,d0
@@ -7683,7 +7776,7 @@ tb_terrain_quad_scene:
         link    a6,#-22
         movem.l d6/a3,-(sp)
         move.l  a0,tb_q_frame_base(a6)
-        lsl.w   #2,d0              ; 2*corner -> 8*corner
+        lsl.w   #2,d0              ; Convert the corner index to a byte offset.
         lea     tb_q_initial_cursors(pc),a1
         move.l  (a1,d0.w),tb_q_fcursor(a6)
         move.l  4(a1,d0.w),tb_q_bcursor(a6)
@@ -7695,14 +7788,14 @@ tb_terrain_quad_scene:
         add.w   d0,d0
         lea     tb_q_solid_table(pc),a0
         move.w  (a0,d0.w),tb_q_frame_painter(a6)
-        ; Keep the incoming page and first row live over setup.
+        ; Keep the incoming page and first row live during setup.
         movea.l d1,a4
-        movea.w d2,a5               ; initialize once, not per segment
+        movea.w d2,a5               ; Initialize the row only once.
         tb_q_add_rows d2,a4
 tb_q_begin_segment:
 .segment:
 .begin_forward:
-        ; The entry row is the start of both edge rails by construction.
+        ; Start both edge chains at the entry row.
         movea.l tb_q_fcursor(a6),a0
         tb_q_inline_edge
         move.l  a0,tb_q_fcursor(a6)
@@ -7720,8 +7813,8 @@ tb_q_begin_segment:
         movea.l d1,a3
         move.w  d3,tb_q_frame_bstop(a6)
 .segment_end:
-        ; The writer needs the row count, not an end address.
-        ; A5 retains the logical end even when the span consumes D3.
+        ; Pass the row count to the writer. Keep the segment end in A5
+        ; because the writer consumes D3.
         macro tb_q_render_segment
         move.w  d0,d3
         sub.w   a5,d3
@@ -7734,15 +7827,15 @@ tb_q_begin_segment:
         cmp.w   d0,d1
         blt.s   .forward_first
         bgt.s   .backward_first
-        ; Equal stops may be terminal, or both edges may restart.
+        ; Equal stops can end the polygon or restart both edges.
         tb_q_render_segment
         cmpa.w  tb_q_frame_endrow(a6),a5
         bhs.s   .end_polygon
         bra.w   .begin_forward
 .forward_first:
-        ; Every valid edge stop is at most the final polygon sample.
-        ; A strict minimum is therefore before it; exactly one rail
-        ; restarts. No repeat of either comparison after painting.
+        ; An edge stop cannot follow the last polygon sample. If the stops differ,
+        ; restart only the edge with the earlier stop.
+        ; Do not repeat these tests after the write.
         move.w  d1,d0
         tb_q_render_segment
         bra.w   .begin_forward
@@ -7755,20 +7848,20 @@ tb_q_begin_segment:
         moveq   #1,d0
         rts
 
-; Nearby base for the word-displacement painter table, kept within d8.
+; Keep the painter-table base within an 8-bit displacement.
 tb_q_paint_base:
-; D0 previous ordinal, D5 signed ordinal step. Scans the regular
-; four-corner chain without pointer wrap or rectangle/row clips.
-; On return A0 next ordinal, other outputs as in tb_r_chain_edge.
+; D0 is the previous ordinal. D5 is the signed ordinal step.
+; Walk four regular corners without wrapping the pointer or testing for clip limits.
+; Return the next ordinal in A0. Other outputs match tb_r_chain_edge.
 
 ; ------------------------------------------------------------------------
 ; Model raster entry points
 ; ------------------------------------------------------------------------
 
-; Prepared, inside object face. Retain the canonical exact packed edge
-; walker and span writers; bypass the generic polygon's duplicate setup.
+; Use the standard edge walker and writers for a prepared inside face.
+; Skip the duplicate general polygon setup.
 
-; Gather a fixed slot and extend the Y extrema in the same pass.
+; Load one fixed vertex slot and update the Y limits.
 tb_m_point macro
         lsl.w   #3,\1
         move.w  (a0,\1.w),(a1)+
@@ -7786,8 +7879,9 @@ tb_m_point macro
 .done\@:
         endm
 
-; A2 prepared scene, A4 face, A6 page. The caller has selected the normal
-; colour callback. Preserve A2-A6/D6-D7. D0=1 drawn; 0 use general clipping.
+; A2 points to the prepared scene, A4 to the face, and A6 to the page.
+; The caller selects the ink writer. Preserve A2-A6 and D6-D7.
+; Return D0 = 1 if drawn, or zero to use general clipping.
         xdef tb_model_poly_scene
 tb_model_poly_scene:
         move.l  a6,d0
@@ -7806,7 +7900,7 @@ tb_model_poly_scene:
         beq.s   .visible
         or.b    (a0,d3.w),d4
 .visible:
-        andi.b  #$21,d4            ; near or outside prepared raster bounds
+        andi.b  #$21,d4            ; Test the near plane and prepared raster bounds.
         bne.w   tb_r_no_poly
         lea     -16(sp),sp
         movea.l sp,a1
@@ -7816,14 +7910,14 @@ tb_model_poly_scene:
         move.w  4(a0,d0.w),d4
         move.w  d4,(a1)+
         move.w  d4,d5
-        moveq   #0,d0              ; byte offset of first minimum Y
+        moveq   #0,d0              ; Start with the first vertex as the minimum.
         tb_m_point d1,4
         tb_m_point d2,8
         cmpi.b  #3,8(a4)
         beq.s   .admit
         tb_m_point d3,12
-        ; Same cyclic test as the generic quad: an extra local minimum
-        ; can only be opposite the first global minimum.
+        ; Only the vertex opposite the first global minimum can be an extra local minimum.
+        ; Use the same test as the general quad path.
         move.w  d0,d1
         eori.w  #8,d1
         move.w  2(sp,d1.w),d2
@@ -7843,8 +7937,8 @@ tb_model_poly_scene:
         ble.w   .fallback
         movea.l sp,a0
         move.l  a6,d1
-        ; Reserve just the active fields below a biased frame pointer,
-        ; rather than the generic polygon's 800-byte scanline array.
+        ; Reserve only active fields below the biased frame pointer.
+        ; The 800-byte general scanline array is not needed.
         link    a6,#-106
         lea     800(a6),a6
         movem.l d6-d7/a2-a5,-(sp)
@@ -7852,7 +7946,7 @@ tb_model_poly_scene:
         move.l  a0,tb_r_base(a6)
         move.l  a1,tb_r_limit(a6)
         adda.w  d0,a0
-        move.l  a0,d0             ; top survives writer selection
+        move.l  a0,d0             ; Keep the top vertex during writer selection.
         move.w  d5,tb_r_endrow(a6)
         st      tb_r_inside_x(a6)
         moveq   #0,d7
@@ -7863,10 +7957,10 @@ tb_model_poly_scene:
 .ink:
         movea.l d1,a0
         bsr.w   tb_r_writer
-        movea.l d1,a4              ; original page; face record is dead
-        move.l  a1,tb_r_painter(a6) ; hot solids restore this between segments
+        movea.l d1,a4              ; Reuse the face register for the page.
+        move.l  a1,tb_r_painter(a6) ; Keep the writer for later segments.
         movea.l a1,a5
-        movea.l d0,a0              ; keep temporary inputs in registers
+        movea.l d0,a0
         move.w  d4,d0
         TB_R_FUSED_START
         bsr.w   tb_r_fused_segment
@@ -7885,16 +7979,16 @@ tb_model_poly_scene:
 ; Paired tree raster entry points
 ; ------------------------------------------------------------------------
 
-; A2 scene, A4 first authored tree face, A6 page. Caller proved face IDs
-; adjacent in painter order. Return D0=0 to draw the unchanged triangles
-; on rejection; preserve A2-A6 and D6-D7 in either case.
-; D4 union mask, D2 destination word's byte offset, A0 destination.
-; Split the high bit by the seam; the low two bits share union coverage.
+; A2 points to the scene, A4 to the first tree face, and A6 to the page.
+; The caller verifies that the two faces are adjacent in painter order.
+; Preserve A2-A6 and D6-D7. Return D0 = 0 to draw the original triangles.
+; D4 holds the union mask. D2 is the word byte offset. A0 points to the destination.
+; Split the high bit at the seam. Use the union for both low bits.
 tb_tree_word macro
         move.w  d4,d0
         not.w   d0
-        and.w   d0,(a0)             ; bit 0 clear for both shades
-        or.w    d4,8000(a0)         ; bit 1 set for both shades
+        and.w   d0,(a0)             ; Clear bit 0 for both shades.
+        or.w    d4,8000(a0)         ; Set bit 1 for both shades.
         cmp.w   tb_r_painter(a6),d2
         bhi.s   .only_ink2\@
         blo.s   .only_ink6\@
@@ -7918,14 +8012,14 @@ tb_tree_pair_scene:
         move.l  a6,d0
         btst    #0,d0
         bne.w   tb_r_no_poly
-        cmpi.w  #$0306,8(a4)      ; triangle, ink 6
+        cmpi.w  #$0306,8(a4)      ; Require a triangle with ink 6.
         bne.w   tb_r_no_poly
-        cmpi.w  #$0302,20(a4)     ; triangle, ink 2
+        cmpi.w  #$0302,20(a4)     ; Require a triangle with ink 2.
         bne.w   tb_r_no_poly
         move.w  10(a4),d4
         cmp.w   22(a4),d4
         bne.w   tb_r_no_poly
-        ; The authored pair is A,B,C and C,B,D.
+        ; The authored pair has vertices A, B, C and C, B, D.
         movem.w (a4),d0-d2
         cmp.w   12(a4),d2
         bne.w   tb_r_no_poly
@@ -7944,7 +8038,7 @@ tb_tree_pair_scene:
         lsl.w   #3,d1
         lsl.w   #3,d2
         lsl.w   #3,d3
-        ; Hull is A,B,D,C, starting its two chains at B.
+        ; Use hull A, B, D, C. Start both chains at B.
         lea     -16(sp),sp
         move.w  (a0,d0.w),(sp)
         move.w  4(a0,d0.w),2(sp)
@@ -7954,7 +8048,7 @@ tb_tree_pair_scene:
         move.w  4(a0,d3.w),10(sp)
         move.w  (a0,d2.w),12(sp)
         move.w  4(a0,d2.w),14(sp)
-        move.w  4(sp),d0           ; shared vertical seam
+        move.w  4(sp),d0           ; Load the shared vertical seam.
         cmp.w   12(sp),d0
         bne.w   .reject
         cmp.w   (sp),d0
@@ -7963,10 +8057,10 @@ tb_tree_pair_scene:
         bge.w   .reject
         move.w  8(sp),d1
         sub.w   (sp),d1
-        cmpi.w  #240,d1           ; <= 15 Q0 pixels after edge rounding
+        cmpi.w  #240,d1           ; Allow at most 15 pixels after rounding.
         bhi.w   .reject
-        move.w  6(sp),d4           ; top
-        move.w  14(sp),d5          ; bottom
+        move.w  6(sp),d4
+        move.w  14(sp),d5
         cmp.w   2(sp),d4
         bge.w   .reject
         cmp.w   10(sp),d4
@@ -7985,8 +8079,8 @@ tb_tree_pair_scene:
         asr.w   #4,d0
         lsl.w   #3,d0
         lea     tb_r_coord_table(pc),a1
-        move.l  4(a1,d0.w),d0      ; seam [last word byte offset | prefix]
-        addq.w  #2,d0              ; undo right offset bias before saving seam
+        move.l  4(a1,d0.w),d0      ; Load the packed seam offset and prefix.
+        addq.w  #2,d0              ; Remove the right offset bias.
         swap    d0
         movea.l sp,a0
         move.l  a6,d1
@@ -7994,7 +8088,7 @@ tb_tree_pair_scene:
         lea     800(a6),a6
         movem.l d6-d7/a2-a5,-(sp)
         move.l  d1,tb_r_surface(a6)
-        move.l  d0,tb_r_painter(a6) ; reuse two words for the constant seam
+        move.l  d0,tb_r_painter(a6) ; Save the constant seam in the writer slot.
         move.l  a0,tb_r_base(a6)
         lea     16(a0),a1
         move.l  a1,tb_r_limit(a6)
@@ -8017,23 +8111,23 @@ tb_tree_pair_scene:
         move.w  tb_r_row(a6),d0
 .segment_row_ready:
 .begin_forward:
-        ; Entry initialized both stops to this row. Only the next
-        ; segment's tail has to choose which edge restarts.
+        ; Both stops initially equal the entry row.
+        ; The next segment tail chooses which edge to restart.
         movea.l tb_r_forward(a6),a0
-        move.w  d0,d2              ; pass the current row already in D0
+        move.w  d0,d2
         bsr.w   tb_r_chain_edge_forward
         move.l  a0,tb_r_forward(a6)
         move.l  d0,d6
         movea.l d1,a2
         move.w  d3,tb_r_fstop(a6)
         move.l  d2,tb_r_fcorrect(a6)
-        move.w  tb_r_row(a6),d0      ; forward call consumed D0
+        move.w  tb_r_row(a6),d0      ; Reload the row after the forward call.
 .reverse_row_ready:
         cmp.w   tb_r_bstop(a6),d0
         bne.s   .segment_end
 .begin_backward:
         movea.l tb_r_back(a6),a0
-        move.w  d0,d2              ; pass the current row already in D0
+        move.w  d0,d2
         bsr.w   tb_r_chain_edge_back
         move.l  a0,tb_r_back(a6)
         move.l  d0,d7
@@ -8053,15 +8147,15 @@ tb_tree_pair_scene:
 .row:
         move.l  d7,d0
         move.l  d6,d1
-        ; Interior sampling gives nonnegative X. Clear Q4 fractions,
-        ; then scale directly to an eight-byte coordinate-table index.
+        ; Interior sampling makes X nonnegative. Remove the Q4 fraction.
+        ; Scale the result to an eight-byte coordinate-table index.
         andi.w  #$7ff0,d0
         andi.w  #$7ff0,d1
         lsr.w   #1,d0
         lsr.w   #1,d1
         cmp.w   d0,d1
         beq.w   .step
-        move.l  (a1,d0.w),d4       ; left [suffix | first byte offset]
+        move.l  (a1,d0.w),d4       ; Load the left suffix and first byte offset.
         move.w  d4,d2
         swap    d4
         move.l  4(a1,d1.w),d5
@@ -8097,29 +8191,27 @@ tb_tree_pair_scene:
         moveq   #1,d0
         rts
 
-        section code,code
-
 ; ------------------------------------------------------------------------
 ; Inset route map
 ; ------------------------------------------------------------------------
 
-; Route inset: 16x16 map samples at 2x2 pixels. The two
-; opaque 2x2 dots and background both use camera-facing axes: decreasing
-; world X goes right and increasing world Z goes down (nearer). The layer
-; shares the three existing display planes; it requires no additional DMA.
-TB_MAP_BASE equ 10*PL_ROW_BYTES+2 ; x=16, y=10 in each plane
+; The inset has 16 x 16 cells. Each cell occupies 2 x 2 pixels.
+; On the inset, decreasing world X goes right. Increasing world Z goes down.
+; The tank dots and map share the three display bitplanes. No additional DMA is necessary.
+TB_MAP_BASE equ 10*PL_ROW_BYTES+2  ; X = 16, Y = 10 in each bitplane.
 TB_MAP_CELLS equ 16
 
-; Reset each physical page's dot history; the underlying inset is immutable.
+; Reset the previous dot positions on both pages. Do not change the map data.
 tb_map_init:
         moveq   #-1,d0
         move.l  d0,tb_map_dot_rows
         move.l  d0,tb_map_dot_rows+4
         rts
 
-; A3=scene, A4=surface. Seed each physical page once after its header
-; copy, then restore just the two previous dots' row pairs from the
-; immutable map. The viewport clear never touches this inset.
+; Inputs: A3 = scene, A4 = back page.
+; Copy the complete map once per page after a header change.
+; On later frames, restore only the row pairs that contained the previous dots.
+; The viewport clear does not change the map.
 tb_map_draw:
         movem.l d2-d5/a2/a5,-(sp)
         lea     tb_map_dot_rows,a5
@@ -8160,7 +8252,7 @@ tb_map_draw:
         movem.l (sp)+,d2-d5/a2/a5
         rts
 
-; D0.W is one old cell row. Restore both screen rows of each plane.
+; Input: D0.W = previous cell row. Restore its two rows in each bitplane.
 .restore_pair:
         lea     .row_offsets(pc),a0
         add.w   d0,d0
@@ -8190,21 +8282,21 @@ map_row set 0
 map_row set map_row+2*PL_ROW_BYTES
         endr
 
-; Both deterministic tank paths are within [-48,+48] in X and Z. Convert
-; to the containing map cell (0..15) before addressing the 2x2 block.
+; Both tank paths stay between -48 and +48 on the X and Z axes.
+; Convert each coordinate to its map cell before it selects a 2 x 2 pixel block.
 .dot:   move.w  4(a1),d0
         bsr.w   .cell
         move.w  d0,(a5)+
         move.w  d0,d1
         lsl.w   #2,d0
         add.w   d1,d0
-        lsl.w   #4,d0           ; two screen rows * 40 bytes
+        lsl.w   #4,d0  ; Two screen rows have 80 bytes.
         lea     TB_MAP_BASE(a4),a0
         adda.w  d0,a0
         move.w  (a1),d0
         bsr.w   .cell
         add.w   d0,d0
-        eori.w  #2*(TB_MAP_CELLS-1),d0 ; mirror the cell, not the pixel
+        eori.w  #2*(TB_MAP_CELLS-1),d0  ; Reverse the cell index, not the pixel index.
         move.l  #$c0000000,d2
         lsr.l   d0,d2
         move.l  d2,d3
@@ -8223,8 +8315,8 @@ map_row set map_row+2*PL_ROW_BYTES
         dbra    d4,.dot_plane
         rts
 
-; D0 signed world coordinate -> 16-cell inset index; +edge is the last
-; cell, not a row beyond the background or the opposite side.
+; Input: D0 = signed world coordinate. Output: D0 = map cell index (0 to 15).
+; The positive boundary belongs to the last cell.
 .cell:
         cmpi.w  #-SC_MAP_EDGE,d0
         blt.s   .cell_low
@@ -8248,12 +8340,12 @@ tb_map_dot_rows: ds.l 2
 ; Terrain edge slope lookup
 ; ------------------------------------------------------------------------
 
-        ; One entry per positive Q4 rise. Dy < 4 never indexes the
-        ; table. Compile-time generation independent of scene/replay.
+        ; The assembler makes one entry for each possible positive Q4 rise.
+        ; The caller does not use the table for a rise less than 4.
 tb_q_slope_table:
 tb_q_slope_dy set 4
-        ; Normalize at each power of two; entries carry a mantissa in
-        ; [8192,16384] and a shift down to Q16.
+        ; Each entry has a mantissa from 8192 to 16384 and a shift count.
+        ; Increase the shift count at each power of two to keep the mantissa in range.
         dcb.w   8,0
 tb_q_slope_shift set 0
         rept    2316
@@ -8268,15 +8360,15 @@ tb_q_slope_dy set tb_q_slope_dy+1
 ; PAL live and final FPS measurement and display
 ; ------------------------------------------------------------------------
 
-; Measure displayed pages in hardware HSYNC lines, not host wall time.
-; CIA-B TOD is the horizontal sync line count (64 us/line on PAL).
-; Read high-to-low to latch a coherent 24-bit counter, never write it.
-FPS_LINES       equ 0          ; accumulated HSYNC lines (long)
-FPS_WORST       equ 4          ; longest individual interval (long)
-FPS_FRAMES      equ 8          ; number of accepted intervals (word)
-FPS_MIN         equ 10         ; min complete window FPS x10 (word)
-FPS_MAX         equ 12         ; max complete window FPS x10 (word)
-FPS_INVALID     equ 14         ; cumulative clock validity (word)
+; Measure intervals between display page changes in horizontal sync lines.
+; The CIA-B time-of-day counter counts one line every 64 microseconds on PAL.
+; Read its three bytes from high to low to get one 24-bit value. Do not write the counter.
+FPS_LINES       equ 0  ; Total horizontal sync lines (longword).
+FPS_WORST       equ 4  ; Longest frame interval (longword).
+FPS_FRAMES      equ 8  ; Number of valid intervals (word).
+FPS_MIN         equ 10  ; Minimum sample FPS in tenths (word).
+FPS_MAX         equ 12  ; Maximum sample FPS in tenths (word).
+FPS_INVALID     equ 14  ; Nonzero if the clock is not valid (word).
 FPS_SECOND      equ 15625
 FPS_NONE        equ $ffff
 
@@ -8306,8 +8398,8 @@ play_fps_row:
         adda.w  d0,a0
         rts
 
-; Called immediately following a page flip. A stage's first displayed
-; image starts its clock, so any transition/setup interval is excluded.
+; Read the clock immediately after a page change.
+; The first page of a stage sets the start time. The interval before it is not a sample.
 play_fps_measure:
         bsr.s   play_fps_row
         moveq   #0,d0
@@ -8318,7 +8410,7 @@ play_fps_measure:
         move.b  CIAB_TODLO,d0
         move.l  d0,d1
         sub.l   play_fps_tod,d0
-        andi.l  #$00ffffff,d0  ; wrap of the CIA's 24-bit line counter
+        andi.l  #$00ffffff,d0  ; Keep the 24-bit difference after a counter wrap.
         move.l  d1,play_fps_tod
         tst.w   FPS_INVALID(a0)
         bne.w   play_fps_measure_done
@@ -8327,8 +8419,8 @@ play_fps_measure:
         st      play_fps_have
         bra.w   play_fps_measure_done
 .interval:
-        ; A native page flip cannot be less than a field (about 312
-        ; lines). Reject stopped/miswired clocks and arbitrary gaps >1s.
+        ; A page change cannot occur less than one field after the previous change.
+        ; Reject counts below 250 lines or above one second.
         cmpi.l  #250,d0
         blo.s   .invalid
         cmpi.l  #FPS_SECOND,d0
@@ -8372,15 +8464,16 @@ play_fps_measure:
 play_fps_measure_done:
         rts
 
-; D0.l elapsed lines, D1.w interval count -> D0.w rounded FPS x10.
-; Round milliseconds first to keep a 16-bit divisor; the source is
-; line-resolution and min/max are complete ~1-second sample windows.
+; Inputs: D0.L = elapsed lines, D1.W = interval count.
+; Output: D0.W = rounded FPS in tenths.
+; Convert to whole milliseconds first so that the divisor fits in 16 bits.
+; Minimum and maximum FPS use complete samples of approximately one second.
 play_fps_to_rate:
         tst.w   d1
         beq.s   .none
         lsl.l   #3,d0
         addi.l  #62,d0
-        divu.w  #125,d0         ; PAL lines * 8 / 125 = milliseconds
+        divu.w  #125,d0  ; PAL lines x 8 / 125 = milliseconds.
         bvs.s   .none
         tst.w   d0
         beq.s   .none
@@ -8410,9 +8503,10 @@ play_fps_stamp_live:
 .no:
         rts
 
-; Draw D0.w (integer tenths or FFFF) with D1.w integer glyphs at A1.
-; Cells are blank in the supplied asset. Write white ink (all planes)
-; with an opaque black background; no other header bytes are touched.
+; Inputs: D0.W = FPS in tenths or $FFFF, D1.W = number of integer digits.
+; A1 points to the first glyph position on the back page.
+; Write white glyphs on a black background in all three bitplanes.
+; Do not change bytes outside the glyph field.
 play_fps_stamp_number:
         lea     -6(sp),sp
         movea.l sp,a0
@@ -8463,8 +8557,8 @@ play_fps_stamp_number:
 play_fps_show_results:
         lea     play_fps_rows,a3
         lea     play_fps_summary,a4
-        moveq   #0,d5            ; worst across valid stages
-        moveq   #0,d6            ; invalid if any required stage failed
+        moveq   #0,d5  ; Longest interval in the valid stages.
+        moveq   #0,d6  ; Nonzero if a stage has invalid data.
         moveq   #3,d7
 .summary:
         tst.w   FPS_INVALID(a3)
@@ -8493,7 +8587,7 @@ play_fps_show_results:
         bne.s   .save_worst
         lsl.l   #4,d5
         addi.l  #12,d5
-        divu.w  #25,d5           ; PAL lines * 16 / 25 = 0.1 ms units
+        divu.w  #25,d5  ; PAL lines x 16 / 25 = tenths of a millisecond.
         bvs.s   .save_worst
         cmpi.w  #9999,d5
         bhi.s   .save_worst
@@ -8528,8 +8622,8 @@ play_fps_show_results:
         lea     137*PL_ROW_BYTES+21(a4),a1
         bsr.w   play_fps_stamp_number
 
-        ; The result page is complete. Use the same safe blanking arm
-        ; as the normal page flip, without charging it to any stage.
+        ; Change to the results page during vertical blanking.
+        ; Do not include the results page in a stage measurement.
         jsr     play_vblank
         move.l  play_copper_back,d0
         move.l  play_copper_front,play_copper_back
